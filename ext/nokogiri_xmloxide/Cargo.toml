@@ -1,0 +1,30 @@
+[package]
+name = "nokogiri-xmloxide"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Experimental Nokogiri backend built on xmloxide (pure-Rust libxml2)"
+
+[lib]
+# The library must be named `nokogiri` so the built artifact is
+# `nokogiri.bundle` exporting `Init_nokogiri`, which is what
+# lib/nokogiri/extension.rb requires.
+name = "nokogiri"
+crate-type = ["cdylib"]
+
+[dependencies]
+# `rb-sys` exposes raw VALUEs, used for cheap object-identity checks.
+magnus = { version = "0.9.4", features = ["rb-sys"] }
+# Direct dependency so build.rs sees rb-sys's DEP_RB_* variables; Cargo only
+# passes those to crates that depend on rb-sys directly.
+rb-sys = "0.9.130"
+# The fork's branch carries patches this backend needs (each an upstream PR
+# candidate). The nokogiri-xmloxide workspace overrides this with its local
+# checkout via [patch] in its .cargo/config.toml.
+xmloxide = { git = "https://github.com/dkam/xmloxide", branch = "nokogiri-backend" }
+
+[build-dependencies]
+rb-sys-env = "0.2.3"
+
+[profile.release]
+debug = 1
