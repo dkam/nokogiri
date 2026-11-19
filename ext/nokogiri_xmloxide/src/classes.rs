@@ -30,6 +30,8 @@ class!(XML_DOCUMENT, "Nokogiri::XML::Document");
 class!(NODE_SET, "Nokogiri::XML::NodeSet");
 class!(NAMESPACE, "Nokogiri::XML::Namespace");
 class!(XML_SYNTAX_ERROR, "Nokogiri::XML::SyntaxError");
+class!(XPATH_SYNTAX_ERROR, "Nokogiri::XML::XPath::SyntaxError");
+class!(XPATH_CONTEXT, "Nokogiri::XML::XPathContext");
 
 /// Shorthand for `ruby.get_inner(&CLASS)`.
 pub fn get(ruby: &Ruby, class: &'static Lazy<RClass>) -> RClass {

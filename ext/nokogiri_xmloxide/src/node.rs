@@ -3,9 +3,15 @@
 //! can't produce Nokogiri's use-after-free bugs, is in
 //! `notes/M2-node-design.md`.
 //!
-//! Re-entrancy rule: never call into Ruby (wrapping, `decorate`, IO) while a
-//! `RefCell` borrow of a document's tree or cache is live. Collect `NodeKey`s
-//! first, drop the borrow, then wrap.
+//! Re-entrancy rules for calls into Ruby (wrapping, `decorate`, IO, XPath
+//! handlers):
+//!
+//! - Never hold a mutable borrow of a tree, or any borrow of a cache, across
+//!   one. Collect `NodeKey`s first, drop the borrow, then wrap.
+//! - A shared borrow of the tree may stay live across one: XPath evaluation
+//!   holds one while a Ruby handler runs, so the handler can read and query
+//!   the document. Code that mutates a tree must therefore use
+//!   `try_borrow_mut` and raise a Ruby error if the document is being read.
 
 use std::cell::{OnceCell, Ref, RefCell};
 use std::collections::HashMap;
@@ -21,6 +27,7 @@ use xmloxide::tree::{Attribute, NodeKind};
 use xmloxide::{Document, NodeId};
 
 use crate::classes;
+use crate::namespace::{self, NsKey};
 use crate::node_set;
 
 /// libxml2's `xmlElementType` values, which Nokogiri exposes as `node_type`.
@@ -78,6 +85,8 @@ pub struct DocState {
     /// Every node wrapper handed out, so a node maps to one Ruby object.
     /// Marked by the document, like the C extension's `node_cache`.
     cache: RefCell<HashMap<NodeKey, Opaque<Value>>>,
+    /// The same for Namespace objects.
+    pub(crate) namespaces: RefCell<HashMap<NsKey, Opaque<Value>>>,
     /// Distinguishes documents in `pointer_id`.
     serial: u32,
     pub url: Option<String>,
@@ -91,6 +100,7 @@ impl DocState {
         Self {
             tree: RefCell::new(tree),
             cache: RefCell::new(HashMap::new()),
+            namespaces: RefCell::new(HashMap::new()),
             serial: NEXT_DOCUMENT_SERIAL.fetch_add(1, Ordering::Relaxed),
             url,
             kind,
@@ -120,13 +130,17 @@ impl DataTypeFunctions for NodeObj {
             marker.mark(handle.document);
         }
         if let Some(doc) = self.doc.get() {
-            // The cache is only ever mutably borrowed for a HashMap insert,
+            // The caches are only ever mutably borrowed for a HashMap insert,
             // which doesn't allocate Ruby objects, so GC can't land here then.
             let cache = doc
                 .cache
                 .try_borrow()
                 .expect("node cache borrowed during GC mark");
-            for value in cache.values() {
+            let namespaces = doc
+                .namespaces
+                .try_borrow()
+                .expect("namespace cache borrowed during GC mark");
+            for value in cache.values().chain(namespaces.values()) {
                 marker.mark(*value);
             }
         }
@@ -254,20 +268,14 @@ fn class_for(ruby: &Ruby, kind: &NodeKind) -> RClass {
 
 // --- Attributes ---------------------------------------------------------
 
-/// `xmlns` and `xmlns:p` declarations. xmloxide stores them as attributes;
-/// libxml2 (and so Nokogiri) treats them as namespace definitions instead.
-fn is_namespace_declaration(attr: &Attribute) -> bool {
-    (attr.name == "xmlns" && attr.prefix.is_none()) || attr.prefix.as_deref() == Some("xmlns")
-}
-
 /// The element's attributes as Nokogiri sees them: no namespace declarations.
 fn attributes_of(tree: &Document, id: NodeId) -> impl Iterator<Item = &Attribute> {
     tree.attributes(id)
         .iter()
-        .filter(|a| !is_namespace_declaration(a))
+        .filter(|a| namespace::declaration(a).is_none())
 }
 
-fn attr_key(owner: NodeId, attr: &Attribute) -> NodeKey {
+pub fn attr_key(owner: NodeId, attr: &Attribute) -> NodeKey {
     NodeKey::Attr {
         owner,
         prefix: attr.prefix.clone(),
@@ -276,7 +284,7 @@ fn attr_key(owner: NodeId, attr: &Attribute) -> NodeKey {
 }
 
 /// The attribute an `Attr` key names, if it is still on its element.
-fn find_attr<'t>(tree: &'t Document, key: &NodeKey) -> Option<&'t Attribute> {
+pub fn find_attr<'t>(tree: &'t Document, key: &NodeKey) -> Option<&'t Attribute> {
     let NodeKey::Attr {
         owner,
         prefix,
@@ -286,28 +294,6 @@ fn find_attr<'t>(tree: &'t Document, key: &NodeKey) -> Option<&'t Attribute> {
         return None;
     };
     attributes_of(tree, *owner).find(|a| a.prefix == *prefix && a.name == *name)
-}
-
-/// Resolves a namespace prefix (`None` for the default namespace) in scope at
-/// `id`, by walking up through the `xmlns` declarations.
-fn lookup_namespace(tree: &Document, id: NodeId, prefix: Option<&str>) -> Option<String> {
-    if prefix == Some("xml") {
-        return Some("http://www.w3.org/XML/1998/namespace".to_owned());
-    }
-    let mut current = Some(id);
-    while let Some(node) = current {
-        if tree.is_element(node) {
-            let found = tree.attributes(node).iter().find(|a| match prefix {
-                None => a.name == "xmlns" && a.prefix.is_none(),
-                Some(p) => a.prefix.as_deref() == Some("xmlns") && a.name == p,
-            });
-            if let Some(decl) = found {
-                return (!decl.value.is_empty()).then(|| decl.value.clone());
-            }
-        }
-        current = tree.parent(node);
-    }
-    None
 }
 
 // --- Methods --------------------------------------------------------------
@@ -548,7 +534,7 @@ fn get(ruby: &Ruby, rb_self: &NodeObj, name: Option<String>) -> Result<Option<St
         return Ok(None);
     }
     let found = match name.split_once(':') {
-        Some((prefix, local)) => match lookup_namespace(&tree, id, Some(prefix)) {
+        Some((prefix, local)) => match namespace::lookup(&tree, id, Some(prefix)) {
             Some(href) => attributes_of(&tree, id)
                 .find(|a| a.name == local && a.namespace.as_deref() == Some(href.as_str())),
             None => attributes_of(&tree, id).find(|a| a.name == name),

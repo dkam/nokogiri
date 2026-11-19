@@ -67,6 +67,12 @@ impl NodeSetObj {
     }
 }
 
+/// The members of a NodeSet object.
+pub fn members(set: Value) -> Result<Vec<Value>, Error> {
+    let ruby = Ruby::get_with(set);
+    Ok(Obj::<NodeSetObj>::try_convert(set)?.values(&ruby))
+}
+
 /// A new NodeSet holding `nodes` (deduplicated), with `@document` set and
 /// the document's decorators applied, as `noko_xml_node_set_wrap` does.
 pub fn new(ruby: &Ruby, document: Value, nodes: Vec<Value>) -> Result<Value, Error> {

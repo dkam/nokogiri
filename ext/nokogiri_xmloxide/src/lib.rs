@@ -24,10 +24,12 @@
 mod classes;
 mod document;
 mod encoding_handler;
+mod namespace;
 mod node;
 mod node_set;
 mod syntax_error;
 mod test_global_handlers;
+mod xpath_context;
 
 use magnus::{Error, Module, RModule, Ruby, Value};
 
@@ -54,8 +56,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     encoding_handler::init(ruby, nokogiri)?;
     test_global_handlers::init(nokogiri)?;
     node::init(ruby)?;
+    namespace::init(ruby)?;
     node_set::init(ruby)?;
     document::init(ruby)?;
+    xpath_context::init(ruby)?;
 
     Ok(())
 }
