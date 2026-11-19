@@ -366,6 +366,54 @@ pub fn rekey(ruby: &Ruby, doc: &DocState, old: &NodeKey, new: NodeKey) -> Result
     Ok(())
 }
 
+/// Points `obj` at `key` in `doc_value` without changing any cache: the
+/// object of a text node that libxml2 merged into a neighbour now refers to
+/// the neighbour, which may have an object of its own.
+pub fn repoint(obj: Obj<NodeObj>, doc_value: Value, key: NodeKey) {
+    *obj.handle.borrow_mut() = Some(Handle {
+        document: doc_value.into(),
+        key,
+    });
+}
+
+/// After a subtree was copied from one document into another, moves the
+/// Ruby objects of the original's nodes and attributes to the copy's, so
+/// they keep their identity in their new document. The copy has the
+/// original's shape, so a walk of each pairs them up.
+pub fn retarget_subtree(
+    ruby: &Ruby,
+    from: &Receiver,
+    original: NodeId,
+    to: &Receiver,
+    copy: NodeId,
+) -> Result<(), Error> {
+    let pairs: Vec<(NodeKey, NodeKey)> = {
+        let source = from.tree();
+        let target = to.tree();
+        let originals = std::iter::once(original).chain(source.descendants(original));
+        let copies = std::iter::once(copy).chain(target.descendants(copy));
+        originals
+            .zip(copies)
+            .flat_map(|(old, new)| {
+                let attributes = source
+                    .attributes(old)
+                    .iter()
+                    .map(move |a| (attr_key(old, a), attr_key(new, a)));
+                std::iter::once((NodeKey::Tree(old), NodeKey::Tree(new))).chain(attributes)
+            })
+            .collect()
+    };
+    for (old, new) in pairs {
+        let Some(value) = from.state().cache.borrow_mut().remove(&old) else {
+            continue;
+        };
+        let obj = Obj::<NodeObj>::try_convert(ruby.get_inner(value))?;
+        repoint(obj, to.doc_value, new.clone());
+        to.state().cache.borrow_mut().insert(new, value);
+    }
+    Ok(())
+}
+
 /// Removes an attribute from its element. If a Ruby object refers to it,
 /// the attribute moves to a detached holder element, so the object keeps
 /// its name and value, as an unlinked `xmlAttr` does in libxml2.

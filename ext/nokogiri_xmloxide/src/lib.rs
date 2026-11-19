@@ -28,6 +28,7 @@ mod encoding_handler;
 mod namespace;
 mod node;
 mod node_set;
+mod reparent;
 mod syntax_error;
 mod test_global_handlers;
 mod warnings;
@@ -60,6 +61,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     node::init(ruby)?;
     namespace::init(ruby)?;
     edit::init(ruby)?;
+    reparent::init(ruby)?;
     node_set::init(ruby)?;
     document::init(ruby)?;
     xpath_context::init(ruby)?;
