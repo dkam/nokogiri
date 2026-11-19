@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use magnus::{
     DataTypeFunctions, Error, Float, Integer, IntoValue, Module, Object, RArray, RClass, RString,
-    Ruby, TypedData, Value, gc, kwargs, method, prelude::*, rb_sys::AsRawValue, typed_data::Obj,
+    Ruby, TypedData, Value, gc, method, prelude::*, rb_sys::AsRawValue, typed_data::Obj,
     value::Opaque,
 };
 use xmloxide::Document;
@@ -26,6 +26,7 @@ use crate::classes;
 use crate::node::{NodeKey, NodeObj, Receiver, attr_key};
 use crate::node_set::{self, NodeSetObj};
 use crate::syntax_error::{self, XPathCode};
+use crate::warnings;
 
 const NOKOGIRI_PREFIX: &str = "nokogiri";
 const NOKOGIRI_URI: &str = "http://www.nokogiri.org/default_ns/ruby/extensions_functions";
@@ -312,23 +313,17 @@ fn aborted() -> XPathError {
 
 impl Functions<'_> {
     /// The deprecation warning for a handler function called without a
-    /// namespace. Like C's `rb_category_warning`, it is only issued when
-    /// `$VERBOSE` is true and `Warning[:deprecated]` is enabled, and an
-    /// exception from a `Warning.warn` hook propagates.
+    /// namespace.
     fn warn_unnamespaced(&self, name: &str) -> Result<(), Error> {
-        let ruby = self.ruby;
-        if !ruby.eval::<Value>("$VERBOSE")?.to_bool() {
-            return Ok(());
-        }
-        let message = format!(
-            "A custom XPath or CSS handler function named '{name}' is being invoked \
-             without a namespace. Please update your query to reference this function \
-             as 'nokogiri:{name}'. Invoking custom handler functions without a namespace \
-             is deprecated and will become an error in Nokogiri v1.17.0."
-        );
-        let options = kwargs!("uplevel" => 0, "category" => ruby.to_symbol("deprecated"));
-        let _: Value = ruby.module_kernel().funcall("warn", (message, options))?;
-        Ok(())
+        warnings::deprecated(
+            self.ruby,
+            &format!(
+                "A custom XPath or CSS handler function named '{name}' is being invoked \
+                 without a namespace. Please update your query to reference this function \
+                 as 'nokogiri:{name}'. Invoking custom handler functions without a namespace \
+                 is deprecated and will become an error in Nokogiri v1.17.0."
+            ),
+        )
     }
 
     fn fail(&self, error: Error) -> XPathError {

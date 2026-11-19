@@ -2,7 +2,7 @@
 
 use magnus::{
     Error, Module, Object, RArray, RClass, RString, Ruby, Value, method, prelude::*,
-    typed_data::Obj,
+    rb_sys::AsRawValue, typed_data::Obj,
 };
 use xmloxide::Document;
 use xmloxide::encoding::EncodingError;
@@ -11,7 +11,8 @@ use xmloxide::parser::{ParseOptions, parse_str_with_options};
 
 use crate::classes;
 use crate::encoding_handler;
-use crate::node::{DocKind, DocState, NodeObj, Receiver};
+use crate::namespace;
+use crate::node::{DocKind, DocState, NodeObj, Receiver, document_receiver};
 use crate::syntax_error;
 
 /// Nokogiri's `ParseOptions` bits (libxml2's `xmlParserOption`) that the
@@ -31,6 +32,12 @@ pub fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("encoding", method!(encoding, 0))?;
     class.define_method("version", method!(version, 0))?;
     class.define_method("url", method!(url, 0))?;
+    class.define_method("encoding=", method!(set_encoding, 1))?;
+    class.define_method("root=", method!(set_root, 1))?;
+    class.define_method(
+        "initialize_copy_with_args",
+        method!(initialize_copy_with_args, 2),
+    )?;
     Ok(())
 }
 
@@ -271,4 +278,94 @@ fn version(ruby: &Ruby, rb_self: &NodeObj) -> Result<String, Error> {
 
 fn url(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
     Ok(Receiver::of(ruby, rb_self)?.state().url.clone())
+}
+
+/// `Document#encoding=(encoding)`
+fn set_encoding(ruby: &Ruby, rb_self: &NodeObj, encoding: String) -> Result<String, Error> {
+    let rcv = Receiver::of(ruby, rb_self)?;
+    rcv.tree_mut(ruby)?.encoding = Some(encoding.clone());
+    Ok(encoding)
+}
+
+/// `Document#root=(root)`: replaces the root element; nil removes it. A
+/// root from another document is copied in, as in C; the object passed
+/// keeps referring to the original.
+fn set_root(ruby: &Ruby, rb_self: &NodeObj, new_root: Value) -> Result<Value, Error> {
+    let rcv = Receiver::of(ruby, rb_self)?;
+    let new_root_rcv = if new_root.is_nil() {
+        None
+    } else {
+        if !new_root.is_kind_of(classes::get(ruby, &classes::NODE)) {
+            return Err(Error::new(
+                ruby.exception_arg_error(),
+                format!(
+                    "expected Nokogiri::XML::Node but received {}",
+                    new_root.class().inspect()
+                ),
+            ));
+        }
+        let node = Receiver::of_value(ruby, new_root)?;
+        let is_element = node.tree_id().is_some_and(|id| node.tree().is_element(id));
+        if !is_element {
+            return Err(Error::new(
+                ruby.exception_type_error(),
+                "root must be a Nokogiri::XML::Element",
+            ));
+        }
+        Some(node)
+    };
+    let same_document = |node: &Receiver| node.doc_value.as_raw() == rcv.doc_value.as_raw();
+    let copied = match &new_root_rcv {
+        Some(node) if !same_document(node) => {
+            let source = node.tree();
+            let mut tree = rcv.tree_mut(ruby)?;
+            let copy = tree.import_node(&source, node.tree_id().expect("an element"));
+            namespace::declare_missing(&mut tree, copy);
+            Some(copy)
+        }
+        _ => None,
+    };
+    let mut tree = rcv.tree_mut(ruby)?;
+    if let Some(current) = tree.root_element() {
+        tree.detach(current);
+    }
+    let attach = copied.or_else(|| new_root_rcv.as_ref().and_then(Receiver::tree_id));
+    if let Some(id) = attach {
+        tree.detach(id);
+        let document_node = tree.root();
+        tree.append_child(document_node, id);
+    }
+    Ok(new_root)
+}
+
+/// `Document#initialize_copy_with_args(other, level)`: makes this newly
+/// allocated object (from `dup` or `clone`) a copy of document `other`;
+/// level 0 copies the document without its children.
+fn initialize_copy_with_args(
+    ruby: &Ruby,
+    rb_self: Obj<NodeObj>,
+    other: Value,
+    level: i64,
+) -> Result<Obj<NodeObj>, Error> {
+    let source = document_receiver(ruby, other)?;
+    let tree = {
+        let original = source.tree();
+        if level == 0 {
+            let mut empty = Document::new();
+            empty.version.clone_from(&original.version);
+            empty.encoding.clone_from(&original.encoding);
+            empty.standalone = original.standalone;
+            empty
+        } else {
+            original.clone()
+        }
+    };
+    let state = DocState::new(tree, source.state().url.clone(), source.state().kind);
+    if !NodeObj::init_document_copy(rb_self, state) {
+        return Err(Error::new(
+            ruby.exception_runtime_error(),
+            "document is already initialized",
+        ));
+    }
+    Ok(rb_self)
 }

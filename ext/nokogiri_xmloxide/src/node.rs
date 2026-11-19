@@ -13,14 +13,14 @@
 //!   the document. Code that mutates a tree must therefore use
 //!   `try_borrow_mut` and raise a Ruby error if the document is being read.
 
-use std::cell::{OnceCell, Ref, RefCell};
-use std::collections::HashMap;
+use std::cell::{OnceCell, Ref, RefCell, RefMut};
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use magnus::{
     DataTypeFunctions, Error, Module, RArray, RClass, Ruby, TypedData, Value, gc, method,
-    prelude::*, typed_data::Obj, value::Opaque,
+    prelude::*, rb_sys::AsRawValue, typed_data::Obj, value::Opaque,
 };
 use xmloxide::serial::{SerializeOptions, serialize_node};
 use xmloxide::tree::{Attribute, NodeKind};
@@ -87,6 +87,10 @@ pub struct DocState {
     cache: RefCell<HashMap<NodeKey, Opaque<Value>>>,
     /// The same for Namespace objects.
     pub(crate) namespaces: RefCell<HashMap<NsKey, Opaque<Value>>>,
+    /// Detached elements that hold attributes removed from their element
+    /// while a Ruby object still refers to them, as an unlinked `xmlAttr`
+    /// lives on in libxml2. Never exposed as nodes.
+    pub(crate) holders: RefCell<HashSet<NodeId>>,
     /// Distinguishes documents in `pointer_id`.
     serial: u32,
     pub url: Option<String>,
@@ -101,6 +105,7 @@ impl DocState {
             tree: RefCell::new(tree),
             cache: RefCell::new(HashMap::new()),
             namespaces: RefCell::new(HashMap::new()),
+            holders: RefCell::new(HashSet::new()),
             serial: NEXT_DOCUMENT_SERIAL.fetch_add(1, Ordering::Relaxed),
             url,
             kind,
@@ -157,6 +162,16 @@ impl NodeObj {
         }
     }
 
+    /// Makes `this` (allocated by `dup`, so uninitialised) the document
+    /// `state`. Returns false, changing nothing, if it already is one.
+    pub fn init_document_copy(this: Obj<Self>, state: DocState) -> bool {
+        if this.doc.set(state).is_err() {
+            return false;
+        }
+        Self::init_document(this);
+        true
+    }
+
     pub fn init_document(this: Obj<Self>) {
         let root = this.doc.get().expect("a document").tree.borrow().root();
         *this.handle.borrow_mut() = Some(Handle {
@@ -191,12 +206,28 @@ impl Receiver {
         })
     }
 
+    /// The receiver for a Ruby value that must be a node object.
+    pub fn of_value(ruby: &Ruby, value: Value) -> Result<Self, Error> {
+        let node = Obj::<NodeObj>::try_convert(value)?;
+        Self::of(ruby, &node)
+    }
+
     pub fn state(&self) -> &DocState {
         self.doc.doc.get().expect("checked in Receiver::of")
     }
 
     pub fn tree(&self) -> Ref<'_, Document> {
         self.state().tree.borrow()
+    }
+
+    /// The tree, for modification.
+    pub fn tree_mut(&self, ruby: &Ruby) -> Result<RefMut<'_, Document>, Error> {
+        tree_mut(ruby, self.state())
+    }
+
+    /// The document object.
+    pub fn document_obj(&self) -> Obj<NodeObj> {
+        self.doc
     }
 
     pub fn tree_id(&self) -> Option<NodeId> {
@@ -219,6 +250,36 @@ impl Receiver {
     }
 }
 
+/// A document's tree, for modification. Raises rather than panicking while
+/// the tree is being read, as when an XPath handler tries to modify the
+/// document it is querying.
+pub fn tree_mut<'a>(ruby: &Ruby, state: &'a DocState) -> Result<RefMut<'a, Document>, Error> {
+    state.tree.try_borrow_mut().map_err(|_| {
+        Error::new(
+            ruby.exception_runtime_error(),
+            "the document can't be modified while it is being read (by an XPath query, for instance)",
+        )
+    })
+}
+
+/// The document data of `value`, if it is an initialised document object.
+pub fn document_receiver(ruby: &Ruby, value: Value) -> Result<Receiver, Error> {
+    let not_a_document = || {
+        Error::new(
+            ruby.exception_type_error(),
+            format!(
+                "wrong argument type {} (expected Nokogiri::XML::Document)",
+                value.class().inspect()
+            ),
+        )
+    };
+    let obj = Obj::<NodeObj>::try_convert(value).map_err(|_| not_a_document())?;
+    if obj.doc.get().is_none() {
+        return Err(not_a_document());
+    }
+    Receiver::of(ruby, &obj)
+}
+
 fn uninitialized(ruby: &Ruby) -> Error {
     Error::new(
         ruby.exception_runtime_error(),
@@ -228,15 +289,28 @@ fn uninitialized(ruby: &Ruby) -> Error {
 
 /// Returns the Ruby object for `key`, creating and caching it on first use.
 pub fn wrap(ruby: &Ruby, doc_value: Value, doc: &DocState, key: NodeKey) -> Result<Value, Error> {
+    wrap_as(ruby, doc_value, doc, key, None)
+}
+
+/// Like [`wrap`], but a new object is of `class` when given (a constructor's
+/// receiver, say) rather than the class for the node's kind.
+pub fn wrap_as(
+    ruby: &Ruby,
+    doc_value: Value,
+    doc: &DocState,
+    key: NodeKey,
+    class: Option<RClass>,
+) -> Result<Value, Error> {
     if let Some(value) = doc.cache.borrow().get(&key) {
         return Ok(ruby.get_inner(*value));
     }
     let class = {
         let tree = doc.tree.borrow();
-        match &key {
-            NodeKey::Tree(id) if *id == tree.root() => return Ok(doc_value),
-            NodeKey::Tree(id) => class_for(ruby, &tree.node(*id).kind),
-            NodeKey::Attr { .. } => classes::get(ruby, &classes::ATTR),
+        match (&key, class) {
+            (NodeKey::Tree(id), _) if *id == tree.root() => return Ok(doc_value),
+            (_, Some(class)) => class,
+            (NodeKey::Tree(id), None) => class_for(ruby, &tree.node(*id).kind),
+            (NodeKey::Attr { .. }, None) => classes::get(ruby, &classes::ATTR),
         }
     };
     let data = NodeObj {
@@ -250,6 +324,102 @@ pub fn wrap(ruby: &Ruby, doc_value: Value, doc: &DocState, key: NodeKey) -> Resu
     doc.cache.borrow_mut().insert(key, value.into());
     let _: Value = doc_value.funcall("decorate", (value,))?;
     Ok(value)
+}
+
+/// Makes `obj` (an object allocated but not initialised, as by `dup`) the
+/// Ruby object for `key`, caching it unless the node already has one.
+pub fn adopt(
+    ruby: &Ruby,
+    obj: Obj<NodeObj>,
+    doc_value: Value,
+    doc: &DocState,
+    key: NodeKey,
+) -> Result<(), Error> {
+    if obj.handle.borrow().is_some() || obj.doc.get().is_some() {
+        return Err(Error::new(
+            ruby.exception_runtime_error(),
+            "node is already initialized",
+        ));
+    }
+    *obj.handle.borrow_mut() = Some(Handle {
+        document: doc_value.into(),
+        key: key.clone(),
+    });
+    doc.cache
+        .borrow_mut()
+        .entry(key)
+        .or_insert_with(|| obj.as_value().into());
+    Ok(())
+}
+
+/// Moves the Ruby object for `old`, if there is one, to `new` within the
+/// same document. Doesn't call into Ruby.
+pub fn rekey(ruby: &Ruby, doc: &DocState, old: &NodeKey, new: NodeKey) -> Result<(), Error> {
+    let Some(value) = doc.cache.borrow_mut().remove(old) else {
+        return Ok(());
+    };
+    let obj = Obj::<NodeObj>::try_convert(ruby.get_inner(value))?;
+    if let Some(handle) = obj.handle.borrow_mut().as_mut() {
+        handle.key = new.clone();
+    }
+    doc.cache.borrow_mut().insert(new, value);
+    Ok(())
+}
+
+/// Removes an attribute from its element. If a Ruby object refers to it,
+/// the attribute moves to a detached holder element, so the object keeps
+/// its name and value, as an unlinked `xmlAttr` does in libxml2.
+pub fn remove_attribute(ruby: &Ruby, doc: &DocState, key: &NodeKey) -> Result<(), Error> {
+    let NodeKey::Attr {
+        owner,
+        prefix,
+        name,
+    } = key
+    else {
+        return Ok(());
+    };
+    if doc.holders.borrow().contains(owner) {
+        return Ok(());
+    }
+    let wrapped = doc.cache.borrow().contains_key(key);
+    let holder = {
+        let mut tree = tree_mut(ruby, doc)?;
+        let NodeKind::Element { attributes, .. } = tree.kind_mut(*owner) else {
+            return Ok(());
+        };
+        let Some(index) = attributes
+            .iter()
+            .position(|a| a.prefix == *prefix && a.name == *name)
+        else {
+            return Ok(());
+        };
+        let attribute = attributes.remove(index);
+        if !wrapped {
+            return Ok(());
+        }
+        tree.create_node(holder_kind(attribute))
+    };
+    doc.holders.borrow_mut().insert(holder);
+    rekey(
+        ruby,
+        doc,
+        key,
+        NodeKey::Attr {
+            owner: holder,
+            prefix: prefix.clone(),
+            name: name.clone(),
+        },
+    )
+}
+
+/// A holder element for one detached attribute.
+pub fn holder_kind(attribute: Attribute) -> NodeKind {
+    NodeKind::Element {
+        name: String::new(),
+        prefix: None,
+        namespace: None,
+        attributes: vec![attribute],
+    }
 }
 
 fn class_for(ruby: &Ruby, kind: &NodeKind) -> RClass {
@@ -325,6 +495,10 @@ pub fn init(ruby: &Ruby) -> Result<(), Error> {
     node.define_method("attribute", method!(attribute, 1))?;
     node.define_method("attribute_with_ns", method!(attribute_with_ns, 2))?;
     node.define_method("attribute_nodes", method!(attribute_nodes, 0))?;
+    node.define_method("path", method!(path, 0))?;
+    node.define_method("lang", method!(lang, 0))?;
+    node.define_method("data_ptr?", method!(has_data, 0))?;
+    node.define_private_method("compare", method!(compare, 1))?;
     node.define_private_method("get", method!(get, 1))?;
     node.define_private_method("native_write_to", method!(native_write_to, 4))?;
     Ok(())
@@ -393,7 +567,9 @@ fn parent(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<Value>, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
     let parent = match &rcv.key {
         NodeKey::Tree(id) => rcv.tree().parent(*id),
-        NodeKey::Attr { owner, .. } => Some(*owner),
+        NodeKey::Attr { owner, .. } => {
+            (!rcv.state().holders.borrow().contains(owner)).then_some(*owner)
+        }
     };
     rcv.wrap_opt(ruby, parent)
 }
@@ -665,4 +841,211 @@ fn escape_attribute(value: &str) -> String {
         }
     }
     out
+}
+
+/// `Node#data_ptr?`: whether the object refers to a node yet.
+fn has_data(rb_self: &NodeObj) -> bool {
+    rb_self.handle.borrow().is_some()
+}
+
+/// The top of the tree `id` is in: the document node, or the root of a
+/// detached subtree.
+fn tree_top(tree: &Document, id: NodeId) -> NodeId {
+    let mut top = id;
+    while let Some(parent) = tree.parent(top) {
+        top = parent;
+    }
+    top
+}
+
+/// Where a node sorts in document order: its tree, then its position, then
+/// (for attributes, which follow their element) the attribute's index.
+fn order_key(tree: &Document, key: &NodeKey) -> (NodeId, u32, u8, usize) {
+    match key {
+        NodeKey::Tree(id) => (tree_top(tree, *id), tree.document_order_key(*id), 0, 0),
+        NodeKey::Attr {
+            owner,
+            prefix,
+            name,
+        } => {
+            let index = tree
+                .attributes(*owner)
+                .iter()
+                .position(|a| a.prefix == *prefix && a.name == *name)
+                .unwrap_or(usize::MAX);
+            (
+                tree_top(tree, *owner),
+                tree.document_order_key(*owner),
+                1,
+                index,
+            )
+        }
+    }
+}
+
+/// `Node#compare(other)` (private; `Node#<=>`): 1 if this node follows
+/// `other` in document order, -1 if it precedes it, 0 if they are the same
+/// node, and -2 if they are in different trees, as libxml2's
+/// `xmlXPathCmpNodes(other, self)` reports.
+fn compare(ruby: &Ruby, rb_self: &NodeObj, other: Value) -> Result<i64, Error> {
+    let this = Receiver::of(ruby, rb_self)?;
+    let other = Receiver::of_value(ruby, other)?;
+    if this.doc_value.as_raw() != other.doc_value.as_raw() {
+        return Ok(-2);
+    }
+    let tree = this.tree();
+    let (this_top, this_pos, this_attr, this_index) = order_key(&tree, &this.key);
+    let (other_top, other_pos, other_attr, other_index) = order_key(&tree, &other.key);
+    if this_top != other_top {
+        return Ok(-2);
+    }
+    Ok(
+        match (this_pos, this_attr, this_index).cmp(&(other_pos, other_attr, other_index)) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        },
+    )
+}
+
+/// `Node#lang`: the nearest `xml:lang` on the node or an ancestor.
+fn lang(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
+    let rcv = Receiver::of(ruby, rb_self)?;
+    let tree = rcv.tree();
+    let mut current = Some(match &rcv.key {
+        NodeKey::Tree(id) => *id,
+        NodeKey::Attr { owner, .. } => *owner,
+    });
+    while let Some(id) = current {
+        let found = tree
+            .attributes(id)
+            .iter()
+            .find(|a| a.name == "lang" && a.namespace.as_deref() == Some(namespace::XML_NAMESPACE));
+        if let Some(attribute) = found {
+            return Ok(Some(attribute.value.clone()));
+        }
+        current = tree.parent(id);
+    }
+    Ok(None)
+}
+
+/// Recognises the siblings a path step counts for its `[n]`.
+type SameKind<'a> = Box<dyn Fn(&NodeKind) -> bool + 'a>;
+
+/// A node's step in its path, and how to recognise its same-kind siblings,
+/// following libxml2's `xmlGetNodePath`.
+fn path_step(tree: &Document, id: NodeId) -> Option<(String, SameKind<'_>)> {
+    let kind = &tree.node(id).kind;
+    Some(match kind {
+        NodeKind::Element {
+            name,
+            prefix,
+            namespace,
+            ..
+        } => {
+            // A default-namespace name can't be written in a path, so libxml2
+            // writes `*` and counts every element sibling.
+            let generic = namespace.is_some() && prefix.is_none();
+            let step = match (namespace, prefix) {
+                (Some(_), Some(p)) => format!("{p}:{name}"),
+                (Some(_), None) => "*".to_owned(),
+                (None, _) => name.clone(),
+            };
+            let same = move |other: &NodeKind| match other {
+                NodeKind::Element {
+                    name: n,
+                    prefix: p,
+                    namespace: ns,
+                    ..
+                } => {
+                    generic
+                        || (n == name
+                            && ((ns == namespace && p == prefix)
+                                || (ns.is_some() && namespace.is_some() && p == prefix)))
+                }
+                _ => false,
+            };
+            (step, Box::new(same))
+        }
+        NodeKind::Comment { .. } => (
+            "comment()".to_owned(),
+            Box::new(|other: &NodeKind| matches!(other, NodeKind::Comment { .. })),
+        ),
+        NodeKind::Text { .. } | NodeKind::CData { .. } => (
+            "text()".to_owned(),
+            Box::new(|other: &NodeKind| {
+                matches!(other, NodeKind::Text { .. } | NodeKind::CData { .. })
+            }),
+        ),
+        NodeKind::ProcessingInstruction { target, .. } => (
+            format!("processing-instruction('{target}')"),
+            Box::new(
+                move |other: &NodeKind| matches!(other, NodeKind::ProcessingInstruction { target: t, .. } if t == target),
+            ),
+        ),
+        _ => return None,
+    })
+}
+
+/// The `[n]` a step needs: its position among same-kind siblings, or none
+/// if it has no such siblings.
+fn occurrence(tree: &Document, id: NodeId, same: &dyn Fn(&NodeKind) -> bool) -> usize {
+    let mut before = 0;
+    let mut sibling = tree.prev_sibling(id);
+    while let Some(s) = sibling {
+        before += usize::from(same(&tree.node(s).kind));
+        sibling = tree.prev_sibling(s);
+    }
+    if before > 0 {
+        return before + 1;
+    }
+    let mut sibling = tree.next_sibling(id);
+    while let Some(s) = sibling {
+        if same(&tree.node(s).kind) {
+            return 1;
+        }
+        sibling = tree.next_sibling(s);
+    }
+    0
+}
+
+/// `Node#path`: an XPath to the node, as libxml2's `xmlGetNodePath` writes
+/// it, or `"?"` where it can't, as the C extension returns.
+fn path(ruby: &Ruby, rb_self: &NodeObj) -> Result<String, Error> {
+    let rcv = Receiver::of(ruby, rb_self)?;
+    let tree = rcv.tree();
+    let mut path = String::new();
+    let mut current = match &rcv.key {
+        NodeKey::Tree(id) => Some(*id),
+        NodeKey::Attr {
+            owner,
+            prefix,
+            name,
+        } => {
+            let attribute = find_attr(&tree, &rcv.key);
+            path = match (attribute.and_then(|a| a.namespace.as_ref()), prefix) {
+                (Some(_), Some(p)) => format!("/@{p}:{name}"),
+                _ => format!("/@{name}"),
+            };
+            (!rcv.state().holders.borrow().contains(owner)).then_some(*owner)
+        }
+    };
+    while let Some(id) = current {
+        if let NodeKind::Document = tree.node(id).kind {
+            if !path.starts_with('/') {
+                path.insert(0, '/');
+            }
+            break;
+        }
+        let Some((step, same)) = path_step(&tree, id) else {
+            return Ok("?".to_owned());
+        };
+        let segment = match occurrence(&tree, id, &*same) {
+            0 => format!("/{step}"),
+            n => format!("/{step}[{n}]"),
+        };
+        path.insert_str(0, &segment);
+        current = tree.parent(id);
+    }
+    Ok(path)
 }

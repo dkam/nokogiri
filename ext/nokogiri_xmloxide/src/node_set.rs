@@ -12,7 +12,8 @@ use magnus::{
 };
 
 use crate::classes;
-use crate::node::NodeObj;
+use crate::edit;
+use crate::node::{NodeObj, Receiver};
 
 #[derive(TypedData, Default)]
 #[magnus(class = "Nokogiri::XML::NodeSet", free_immediately, mark)]
@@ -112,6 +113,7 @@ pub fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("|", method!(union, 1))?;
     class.define_method("&", method!(intersection, 1))?;
     class.define_method("-", method!(difference, 1))?;
+    class.define_method("unlink", method!(unlink, 0))?;
     class.define_private_method("initialize_copy", method!(initialize_copy, 1))?;
     Ok(())
 }
@@ -207,6 +209,16 @@ fn difference(ruby: &Ruby, rb_self: Obj<NodeSetObj>, other: Value) -> Result<Val
         .filter(|v| !other.contains(&(v.as_raw() as usize)))
         .collect();
     new(ruby, document_of(rb_self)?, nodes)
+}
+
+/// `NodeSet#unlink`: unlinks each node (namespaces stay where they are).
+fn unlink(ruby: &Ruby, rb_self: Obj<NodeSetObj>) -> Result<Obj<NodeSetObj>, Error> {
+    for value in rb_self.values(ruby) {
+        if let Ok(node) = Obj::<NodeObj>::try_convert(value) {
+            edit::unlink_receiver(ruby, &Receiver::of(ruby, &node)?)?;
+        }
+    }
+    Ok(rb_self)
 }
 
 fn initialize_copy(ruby: &Ruby, rb_self: &NodeSetObj, other: Value) -> Result<(), Error> {
