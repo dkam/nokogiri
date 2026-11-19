@@ -67,6 +67,7 @@ enum Type {
     EntityRef,
     Dtd,
     Attribute,
+    Fragment,
 }
 
 fn type_of(tree: &Document, key: &NodeKey) -> Type {
@@ -82,19 +83,22 @@ fn type_of(tree: &Document, key: &NodeKey) -> Type {
         NodeKind::ProcessingInstruction { .. } => Type::Pi,
         NodeKind::EntityRef { .. } => Type::EntityRef,
         NodeKind::DocumentType { .. } => Type::Dtd,
+        NodeKind::DocumentFragment => Type::Fragment,
     }
 }
 
 /// The DOM's parent–child rules, as the C extension applies them (with text
 /// allowed directly under a document, for compatibility).
 fn allowed(parent: Type, child: Type) -> bool {
-    use Type::{Attribute, CData, Comment, Document, Dtd, Element, EntityRef, Pi, Text};
+    use Type::{Attribute, CData, Comment, Document, Dtd, Element, EntityRef, Fragment, Pi, Text};
     match parent {
         Document => matches!(
             child,
             Element | Pi | Comment | Dtd | Text | CData | EntityRef
         ),
-        Element | EntityRef => matches!(child, Element | Pi | Comment | Text | CData | EntityRef),
+        Fragment | Element | EntityRef => {
+            matches!(child, Element | Pi | Comment | Text | CData | EntityRef)
+        }
         Attribute => matches!(child, Text | EntityRef),
         _ => false,
     }

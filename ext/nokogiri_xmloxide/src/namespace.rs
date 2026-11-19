@@ -81,7 +81,7 @@ pub fn lookup(tree: &Document, id: NodeId, prefix: Option<&str>) -> Option<Strin
 
 /// libxml2's `xmlGetNsList`: every declaration in scope at `id`, innermost
 /// first. An inner declaration hides an outer one with the same prefix.
-fn in_scope(tree: &Document, id: NodeId) -> Vec<(NsKey, String)> {
+pub fn in_scope(tree: &Document, id: NodeId) -> Vec<(NsKey, String)> {
     let mut found: Vec<(NsKey, String)> = Vec::new();
     let mut current = Some(id);
     while let Some(node) = current {

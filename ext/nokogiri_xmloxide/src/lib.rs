@@ -25,6 +25,7 @@ mod classes;
 mod document;
 mod edit;
 mod encoding_handler;
+mod fragment;
 mod namespace;
 mod node;
 mod node_set;
@@ -62,6 +63,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     namespace::init(ruby)?;
     edit::init(ruby)?;
     reparent::init(ruby)?;
+    fragment::init(ruby)?;
     node_set::init(ruby)?;
     document::init(ruby)?;
     xpath_context::init(ruby)?;

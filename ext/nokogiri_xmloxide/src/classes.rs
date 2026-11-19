@@ -27,6 +27,7 @@ class!(
 class!(ENTITY_REFERENCE, "Nokogiri::XML::EntityReference");
 class!(DTD, "Nokogiri::XML::DTD");
 class!(XML_DOCUMENT, "Nokogiri::XML::Document");
+class!(DOCUMENT_FRAGMENT, "Nokogiri::XML::DocumentFragment");
 class!(NODE_SET, "Nokogiri::XML::NodeSet");
 class!(NAMESPACE, "Nokogiri::XML::Namespace");
 class!(XML_SYNTAX_ERROR, "Nokogiri::XML::SyntaxError");

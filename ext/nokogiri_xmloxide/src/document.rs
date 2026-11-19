@@ -60,7 +60,7 @@ pub fn wrap(
     Ok(document.as_value())
 }
 
-fn parser_options(options: i64) -> ParseOptions {
+pub fn parser_options(options: i64) -> ParseOptions {
     let mut parse = ParseOptions::default()
         .recover(options & parse_options::RECOVER != 0)
         .no_blanks(options & parse_options::NOBLANKS != 0);

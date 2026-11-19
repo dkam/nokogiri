@@ -40,6 +40,7 @@ mod node_type {
     pub const PI: i64 = 7;
     pub const COMMENT: i64 = 8;
     pub const DOCUMENT: i64 = 9;
+    pub const DOCUMENT_FRAG: i64 = 11;
     pub const HTML_DOCUMENT: i64 = 13;
     pub const DTD: i64 = 14;
 }
@@ -480,6 +481,7 @@ fn class_for(ruby: &Ruby, kind: &NodeKind) -> RClass {
         NodeKind::EntityRef { .. } => &classes::ENTITY_REFERENCE,
         NodeKind::DocumentType { .. } => &classes::DTD,
         NodeKind::Document => &classes::NODE,
+        NodeKind::DocumentFragment => &classes::DOCUMENT_FRAGMENT,
     };
     classes::get(ruby, class)
 }
@@ -571,8 +573,9 @@ fn node_name(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
         NodeKind::ProcessingInstruction { target, .. } => Some(target.clone()),
         NodeKind::EntityRef { name, .. } => Some(name.clone()),
         NodeKind::DocumentType { name, .. } => Some(name.clone()),
-        // Like libxml2: documents have no name (Document#name is Ruby).
-        NodeKind::Document => None,
+        // Like libxml2: documents and fragments have no name (their #name
+        // is Ruby).
+        NodeKind::Document | NodeKind::DocumentFragment => None,
     })
 }
 
@@ -590,6 +593,7 @@ fn node_type_of(ruby: &Ruby, rb_self: &NodeObj) -> Result<i64, Error> {
         NodeKind::ProcessingInstruction { .. } => node_type::PI,
         NodeKind::EntityRef { .. } => node_type::ENTITY_REF,
         NodeKind::DocumentType { .. } => node_type::DTD,
+        NodeKind::DocumentFragment => node_type::DOCUMENT_FRAG,
         NodeKind::Document => match rcv.state().kind {
             DocKind::Xml => node_type::DOCUMENT,
             DocKind::Html => node_type::HTML_DOCUMENT,
@@ -725,9 +729,10 @@ fn content(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
         | NodeKind::Comment { content } => Some(content.clone()),
         NodeKind::ProcessingInstruction { data, .. } => Some(data.clone().unwrap_or_default()),
         NodeKind::DocumentType { .. } => None,
-        NodeKind::Element { .. } | NodeKind::EntityRef { .. } | NodeKind::Document => {
-            Some(tree.text_content(id))
-        }
+        NodeKind::Element { .. }
+        | NodeKind::EntityRef { .. }
+        | NodeKind::Document
+        | NodeKind::DocumentFragment => Some(tree.text_content(id)),
     })
 }
 
