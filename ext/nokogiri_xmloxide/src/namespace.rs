@@ -15,7 +15,7 @@ use xmloxide::tree::{Attribute, NodeKind};
 use xmloxide::{Document, NodeId};
 
 use crate::classes;
-use crate::node::{NodeKey, NodeObj, Receiver, find_attr, rekey};
+use crate::node::{NodeKey, NodeObj, Receiver, edit_attribute, find_attr};
 use crate::node_set;
 
 pub const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
@@ -52,6 +52,15 @@ pub fn declaration(attr: &Attribute) -> Option<(Option<&str>, &str)> {
     }
 }
 
+/// Splits `prefix:local` as libxml2's `xmlSplitQName2` does: a name with an
+/// empty prefix or local part has no prefix.
+pub fn split_qname(name: &str) -> (Option<&str>, &str) {
+    match name.split_once(':') {
+        Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => (Some(prefix), local),
+        _ => (None, name),
+    }
+}
+
 /// The declarations made directly on `id`, in document order.
 fn declarations(tree: &Document, id: NodeId) -> impl Iterator<Item = (Option<&str>, &str)> {
     tree.attributes(id).iter().filter_map(declaration)
@@ -59,15 +68,12 @@ fn declarations(tree: &Document, id: NodeId) -> impl Iterator<Item = (Option<&st
 
 /// The element that declares `prefix` in scope at `id` (the nearest one,
 /// walking up), and the URI it declares.
-fn resolve(tree: &Document, id: NodeId, prefix: Option<&str>) -> Option<(NodeId, String)> {
-    let mut current = Some(id);
-    while let Some(node) = current {
-        if let Some((_, href)) = declarations(tree, node).find(|(p, _)| *p == prefix) {
-            return Some((node, href.to_owned()));
-        }
-        current = tree.parent(node);
-    }
-    None
+fn resolve<'t>(tree: &'t Document, id: NodeId, prefix: Option<&str>) -> Option<(NodeId, &'t str)> {
+    tree.ancestors(id).find_map(|node| {
+        declarations(tree, node)
+            .find(|(p, _)| *p == prefix)
+            .map(|(_, href)| (node, href))
+    })
 }
 
 /// The URI `prefix` stands for at `id`. An empty URI (`xmlns=""`) undeclares
@@ -76,15 +82,16 @@ pub fn lookup(tree: &Document, id: NodeId, prefix: Option<&str>) -> Option<Strin
     if prefix == Some("xml") {
         return Some(XML_NAMESPACE.to_owned());
     }
-    resolve(tree, id, prefix).and_then(|(_, href)| (!href.is_empty()).then_some(href))
+    resolve(tree, id, prefix)
+        .filter(|(_, href)| !href.is_empty())
+        .map(|(_, href)| href.to_owned())
 }
 
 /// libxml2's `xmlGetNsList`: every declaration in scope at `id`, innermost
 /// first. An inner declaration hides an outer one with the same prefix.
 pub fn in_scope(tree: &Document, id: NodeId) -> Vec<(NsKey, String)> {
     let mut found: Vec<(NsKey, String)> = Vec::new();
-    let mut current = Some(id);
-    while let Some(node) = current {
+    for node in tree.ancestors(id) {
         for (prefix, href) in declarations(tree, node) {
             if !found.iter().any(|(key, _)| key.prefix.as_deref() == prefix) {
                 let key = NsKey {
@@ -94,7 +101,6 @@ pub fn in_scope(tree: &Document, id: NodeId) -> Vec<(NsKey, String)> {
                 found.push((key, href.to_owned()));
             }
         }
-        current = tree.parent(node);
     }
     found
 }
@@ -199,29 +205,10 @@ fn set_node_namespace(
                 *namespace = new_href;
             }
         }
-        key @ NodeKey::Attr {
-            owner,
-            prefix,
-            name,
-        } => {
-            {
-                let mut tree = rcv.tree_mut(ruby)?;
-                if let NodeKind::Element { attributes, .. } = tree.kind_mut(*owner)
-                    && let Some(attribute) = attributes
-                        .iter_mut()
-                        .find(|a| a.prefix == *prefix && a.name == *name)
-                {
-                    attribute.prefix.clone_from(&new_prefix);
-                    attribute.namespace = new_href;
-                }
-            }
-            let moved = NodeKey::Attr {
-                owner: *owner,
-                prefix: new_prefix,
-                name: name.clone(),
-            };
-            rekey(ruby, rcv.state(), key, moved)?;
-        }
+        key @ NodeKey::Attr { .. } => edit_attribute(ruby, rcv.state(), key, |attribute| {
+            attribute.prefix = new_prefix;
+            attribute.namespace = new_href;
+        })?,
     }
     Ok(())
 }
@@ -333,21 +320,8 @@ fn namespace_definitions(ruby: &Ruby, rb_self: &NodeObj) -> Result<RArray, Error
 /// An attribute sees its element's scope, as in libxml2.
 fn namespace_scopes(ruby: &Ruby, rb_self: &NodeObj) -> Result<RArray, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
-    let anchor = match &rcv.key {
-        NodeKey::Tree(id) => *id,
-        NodeKey::Attr { owner, .. } => *owner,
-    };
-    let found = in_scope(&rcv.tree(), anchor);
+    let found = in_scope(&rcv.tree(), rcv.key.anchor());
     wrap_all(ruby, &rcv, found)
-}
-
-/// The element a node's namespace lookups start from: itself, an
-/// attribute's element, or another node's parent.
-fn anchor(rcv: &Receiver) -> NodeId {
-    match &rcv.key {
-        NodeKey::Tree(id) => *id,
-        NodeKey::Attr { owner, .. } => *owner,
-    }
 }
 
 /// `Node#add_namespace_definition(prefix, href)`, as the C extension does
@@ -362,50 +336,40 @@ fn add_namespace_definition(
     href: String,
 ) -> Result<Option<Value>, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
-    let start = anchor(&rcv);
     let prefix = prefix.as_deref();
     let in_scope = if prefix == Some("xml") {
         Some((rcv.tree().root(), XML_NAMESPACE.to_owned()))
     } else {
-        resolve(&rcv.tree(), start, prefix)
+        let tree = rcv.tree();
+        resolve(&tree, rcv.key.anchor(), prefix).map(|(owner, href)| (owner, href.to_owned()))
     };
-    let in_scope_was_none = in_scope.is_none();
-    let is_element = rcv.tree_id().is_some_and(|id| rcv.tree().is_element(id));
-    let (key, href) = match in_scope {
-        Some((owner, declared)) => (
-            NsKey {
-                owner,
-                prefix: prefix.map(str::to_owned),
-            },
-            declared,
-        ),
+    let ((owner, href), declared_on_parent) = match in_scope {
+        Some(found) => (found, false),
         None => {
             // A non-element declares on its parent element (an attribute's
-            // parent is its element).
-            let element = if is_element {
-                Some(start)
-            } else {
+            // parent is its element), and takes the namespace itself.
+            let (element, declared_on_parent) = {
                 let tree = rcv.tree();
-                match &rcv.key {
-                    NodeKey::Attr { .. } => Some(start),
-                    NodeKey::Tree(id) => tree.parent(*id).filter(|p| tree.is_element(*p)),
+                match rcv.key {
+                    NodeKey::Tree(id) if tree.is_element(id) => (id, false),
+                    NodeKey::Tree(id) => match tree.parent(id).filter(|p| tree.is_element(*p)) {
+                        Some(parent) => (parent, true),
+                        None => return Ok(None),
+                    },
+                    NodeKey::Attr { owner, .. } => (owner, true),
                 }
             };
-            let Some(element) = element else {
-                return Ok(None);
-            };
             declare(&mut *rcv.tree_mut(ruby)?, element, prefix, &href);
-            let key = NsKey {
-                owner: element,
-                prefix: prefix.map(str::to_owned),
-            };
-            (key, href)
+            ((element, href), declared_on_parent)
         }
     };
-    let declared_on_parent = in_scope_was_none && !is_element;
     if prefix.is_none() || declared_on_parent {
         set_node_namespace(ruby, &rcv, Some((prefix, &href)))?;
     }
+    let key = NsKey {
+        owner,
+        prefix: prefix.map(str::to_owned),
+    };
     wrap(ruby, &rcv, key, href).map(Some)
 }
 

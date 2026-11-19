@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 
 use magnus::{
-    DataTypeFunctions, Error, Module, Object, RArray, Ruby, TypedData, Value, gc, method,
+    DataTypeFunctions, Error, Integer, Module, Object, RArray, Ruby, TypedData, Value, gc, method,
     prelude::*, rb_sys::AsRawValue, typed_data::Obj, value::Opaque,
 };
 
@@ -75,23 +75,12 @@ pub fn members(set: Value) -> Result<Vec<Value>, Error> {
     Ok(Obj::<NodeSetObj>::try_convert(set)?.values(&ruby))
 }
 
-/// The objects' identities, for set operations in linear time.
-fn identities(values: &[Value]) -> HashSet<usize> {
-    values.iter().map(|v| v.as_raw() as usize).collect()
-}
-
-/// A new NodeSet holding `nodes` (deduplicated, keeping first occurrences),
-/// with `@document` set and the document's decorators applied, as
+/// A new NodeSet holding `nodes`, which must be distinct objects, with
+/// `@document` set and the document's decorators applied, as
 /// `noko_xml_node_set_wrap` does.
 pub fn new(ruby: &Ruby, document: Value, nodes: Vec<Value>) -> Result<Value, Error> {
-    let mut seen = HashSet::with_capacity(nodes.len());
-    let items: Vec<Opaque<Value>> = nodes
-        .into_iter()
-        .filter(|node| seen.insert(node.as_raw() as usize))
-        .map(Into::into)
-        .collect();
     let set = ruby.obj_wrap(NodeSetObj {
-        items: RefCell::new(items),
+        items: RefCell::new(nodes.into_iter().map(Into::into).collect()),
     });
     set.ivar_set("@document", document)?;
     if !document.is_nil() {
@@ -151,6 +140,19 @@ fn to_a(ruby: &Ruby, rb_self: &NodeSetObj) -> Result<RArray, Error> {
 /// `[]` and `slice`: Array's indexing rules exactly (index, start+length,
 /// range), returning a NodeSet wherever Array would return an Array.
 fn slice(ruby: &Ruby, rb_self: Obj<NodeSetObj>, args: &[Value]) -> Result<Value, Error> {
+    // NodeSet#each indexes one at a time, so a single index must not copy
+    // the set.
+    if let [index] = args
+        && let Some(index) = Integer::from_value(*index)
+    {
+        let items = rb_self.items.borrow();
+        let len = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        let position = index.to_i64().map(|i| if i < 0 { i + len } else { i });
+        return Ok(match position {
+            Ok(i) if (0..len).contains(&i) => ruby.get_inner(items[i as usize]),
+            _ => ruby.qnil().as_value(),
+        });
+    }
     let array = to_a(ruby, &rb_self)?;
     let result: Value = array.funcall("[]", args)?;
     match RArray::from_value(result) {
@@ -186,29 +188,42 @@ fn other_set(ruby: &Ruby, other: Value) -> Result<Obj<NodeSetObj>, Error> {
 
 fn union(ruby: &Ruby, rb_self: Obj<NodeSetObj>, other: Value) -> Result<Value, Error> {
     let other = other_set(ruby, other)?;
-    let mut nodes = rb_self.values(ruby);
-    nodes.extend(other.values(ruby));
+    let mut seen = HashSet::new();
+    let nodes = rb_self
+        .values(ruby)
+        .into_iter()
+        .chain(other.values(ruby))
+        .filter(|v| seen.insert(v.as_raw()))
+        .collect();
+    new(ruby, document_of(rb_self)?, nodes)
+}
+
+/// This set's members that are (`&`) or aren't (`-`) in `other`.
+fn filtered(
+    ruby: &Ruby,
+    rb_self: Obj<NodeSetObj>,
+    other: Value,
+    in_other: bool,
+) -> Result<Value, Error> {
+    let other: HashSet<_> = other_set(ruby, other)?
+        .values(ruby)
+        .iter()
+        .map(|v| v.as_raw())
+        .collect();
+    let nodes = rb_self
+        .values(ruby)
+        .into_iter()
+        .filter(|v| other.contains(&v.as_raw()) == in_other)
+        .collect();
     new(ruby, document_of(rb_self)?, nodes)
 }
 
 fn intersection(ruby: &Ruby, rb_self: Obj<NodeSetObj>, other: Value) -> Result<Value, Error> {
-    let other = identities(&other_set(ruby, other)?.values(ruby));
-    let nodes = rb_self
-        .values(ruby)
-        .into_iter()
-        .filter(|v| other.contains(&(v.as_raw() as usize)))
-        .collect();
-    new(ruby, document_of(rb_self)?, nodes)
+    filtered(ruby, rb_self, other, true)
 }
 
 fn difference(ruby: &Ruby, rb_self: Obj<NodeSetObj>, other: Value) -> Result<Value, Error> {
-    let other = identities(&other_set(ruby, other)?.values(ruby));
-    let nodes = rb_self
-        .values(ruby)
-        .into_iter()
-        .filter(|v| !other.contains(&(v.as_raw() as usize)))
-        .collect();
-    new(ruby, document_of(rb_self)?, nodes)
+    filtered(ruby, rb_self, other, false)
 }
 
 /// `NodeSet#unlink`: unlinks each node (namespaces stay where they are).

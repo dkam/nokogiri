@@ -15,7 +15,7 @@ use xmloxide::{Document, NodeId};
 use crate::classes;
 use crate::namespace;
 use crate::node::{
-    NodeKey, NodeObj, Receiver, adopt, document_receiver, find_attr, holder_kind, rekey,
+    NodeKey, NodeObj, Receiver, adopt, document_receiver, edit_attribute, find_attr, new_holder,
     remove_attribute, wrap_as,
 };
 use crate::warnings;
@@ -50,18 +50,11 @@ pub fn init(ruby: &Ruby) -> Result<(), Error> {
 
 // --- Constructors -------------------------------------------------------------
 
-/// Checks `rb_scan_args`'s "N*": at least `n` arguments.
-fn at_least<'a>(ruby: &Ruby, args: &'a [Value], n: usize) -> Result<&'a [Value], Error> {
-    if args.len() < n {
-        return Err(Error::new(
-            ruby.exception_arg_error(),
-            format!(
-                "wrong number of arguments (given {}, expected {n}+)",
-                args.len()
-            ),
-        ));
-    }
-    Ok(&args[..n])
+/// The first `N` arguments, after `rb_scan_args`'s "N*" check that there are
+/// at least `N`.
+fn leading<const N: usize>(ruby: &Ruby, args: &[Value]) -> Result<[Value; N], Error> {
+    ruby.check_arity(args.len(), N..)?;
+    Ok(std::array::from_fn(|i| args[i]))
 }
 
 /// `StringValueCStr`: a String (or something with `to_str`).
@@ -73,8 +66,8 @@ fn class_name(value: Value) -> String {
     value.class().inspect()
 }
 
-/// The document a constructor's document argument stands for. A non-Document
-/// node is accepted, with a deprecation warning, and stands for its document.
+/// The node a constructor's document argument names. A non-Document node is
+/// accepted, with a deprecation warning, for its document.
 fn constructor_document(
     ruby: &Ruby,
     value: Value,
@@ -87,13 +80,23 @@ fn constructor_document(
     if !value.is_kind_of(classes::get(ruby, &classes::XML_DOCUMENT)) {
         warnings::deprecated(ruby, deprecation)?;
     }
-    let rcv = Receiver::of_value(ruby, value)?;
-    Receiver::of(ruby, &rcv.document_obj())
+    Receiver::of_value(ruby, value)
 }
 
-/// Creates the Ruby object for a new node, then, as the C constructors do,
-/// calls `initialize` with the constructor's arguments and yields it to the
-/// block, if there is one.
+/// Creates node `kind` in `doc`'s document, then, as the C constructors do,
+/// makes its Ruby object (of `class`, if given), calls `initialize` with the
+/// constructor's arguments, and yields it to the block, if there is one.
+fn construct(
+    ruby: &Ruby,
+    doc: &Receiver,
+    kind: NodeKind,
+    class: Option<RClass>,
+    args: &[Value],
+) -> Result<Value, Error> {
+    let key = NodeKey::Tree(doc.tree_mut(ruby)?.create_node(kind));
+    finish(ruby, doc, key, class, args)
+}
+
 fn finish(
     ruby: &Ruby,
     doc: &Receiver,
@@ -109,18 +112,12 @@ fn finish(
     Ok(node)
 }
 
-fn create(ruby: &Ruby, doc: &Receiver, kind: NodeKind) -> Result<NodeKey, Error> {
-    Ok(NodeKey::Tree(doc.tree_mut(ruby)?.create_node(kind)))
-}
-
 /// `Node.new(name, document, *rest) { |node| ... }`
 fn node_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
-    let [name, document] = at_least(ruby, args, 2)? else {
-        unreachable!()
-    };
+    let [name, document] = leading(ruby, args)?;
     let doc = constructor_document(
         ruby,
-        *document,
+        document,
         || {
             Error::new(
                 ruby.exception_arg_error(),
@@ -131,76 +128,84 @@ fn node_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> 
          Document instead, or prefer an alternative constructor like Node#add_child. This \
          will become an error in Nokogiri v1.17.0.",
     )?;
-    let name = string(*name)?;
-    let key = NodeKey::Tree(doc.tree_mut(ruby)?.create_element(&name));
+    let kind = NodeKind::Element {
+        name: string(name)?,
+        prefix: None,
+        namespace: None,
+        attributes: Vec::new(),
+    };
     // Node.new makes an object of the node's own class (Element); a
     // subclass's .new makes one of the subclass.
     let node_class = classes::get(ruby, &classes::NODE);
     let class = (class.as_raw() != node_class.as_raw()).then_some(class);
-    finish(ruby, &doc, key, class, args)
+    construct(ruby, &doc, kind, class, args)
+}
+
+/// `Text.new(string, document)` and `CDATA.new(document, string)`, which
+/// differ only in argument order.
+fn character_data_new(
+    ruby: &Ruby,
+    class: RClass,
+    args: &[Value],
+    (document, content): (Value, Value),
+    (position, class_label): (&str, &str),
+    kind: fn(String) -> NodeKind,
+) -> Result<Value, Error> {
+    let doc = constructor_document(
+        ruby,
+        document,
+        || {
+            Error::new(
+                ruby.exception_type_error(),
+                format!(
+                    "expected {position} parameter to be a Nokogiri::XML::Document, received {}",
+                    class_name(document)
+                ),
+            )
+        },
+        &format!(
+            "Passing a Node as the {position} parameter to {class_label}.new is deprecated. \
+             Please pass a Document instead. This will become an error in Nokogiri v1.17.0."
+        ),
+    )?;
+    construct(ruby, &doc, kind(string(content)?), Some(class), args)
 }
 
 /// `Text.new(string, document, *rest)`
 fn text_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
-    let [content, document] = at_least(ruby, args, 2)? else {
-        unreachable!()
-    };
-    let doc = constructor_document(
+    let [content, document] = leading(ruby, args)?;
+    character_data_new(
         ruby,
-        *document,
-        || {
-            Error::new(
-                ruby.exception_type_error(),
-                format!(
-                    "expected second parameter to be a Nokogiri::XML::Document, received {}",
-                    class_name(*document)
-                ),
-            )
-        },
-        "Passing a Node as the second parameter to Text.new is deprecated. Please pass a \
-         Document instead. This will become an error in Nokogiri v1.17.0.",
-    )?;
-    let content = string(*content)?;
-    let key = create(ruby, &doc, NodeKind::Text { content })?;
-    finish(ruby, &doc, key, Some(class), args)
+        class,
+        args,
+        (document, content),
+        ("second", "Text"),
+        |content| NodeKind::Text { content },
+    )
 }
 
 /// `CDATA.new(document, content, *rest)`
 fn cdata_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
-    let [document, content] = at_least(ruby, args, 2)? else {
-        unreachable!()
-    };
-    let doc = constructor_document(
+    let [document, content] = leading(ruby, args)?;
+    character_data_new(
         ruby,
-        *document,
-        || {
-            Error::new(
-                ruby.exception_type_error(),
-                format!(
-                    "expected first parameter to be a Nokogiri::XML::Document, received {}",
-                    class_name(*document)
-                ),
-            )
-        },
-        "Passing a Node as the first parameter to CDATA.new is deprecated. Please pass a \
-         Document instead. This will become an error in Nokogiri v1.17.0.",
-    )?;
-    let content = string(*content)?;
-    let key = create(ruby, &doc, NodeKind::CData { content })?;
-    finish(ruby, &doc, key, Some(class), args)
+        class,
+        args,
+        (document, content),
+        ("first", "CDATA"),
+        |content| NodeKind::CData { content },
+    )
 }
 
 /// `Comment.new(document_or_node, content, *rest)`
 fn comment_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
-    let [document, content] = at_least(ruby, args, 2)? else {
-        unreachable!()
-    };
-    let Some(content) = RString::from_value(*content) else {
+    let [document, content] = leading(ruby, args)?;
+    let Some(content) = RString::from_value(content) else {
         return Err(Error::new(
             ruby.exception_type_error(),
             format!(
                 "wrong argument type {} (expected String)",
-                class_name(*content)
+                class_name(content)
             ),
         ));
     };
@@ -210,61 +215,46 @@ fn comment_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Erro
             "first argument must be a XML::Document or XML::Node",
         ));
     }
-    let node = Receiver::of_value(ruby, *document)?;
-    let doc = Receiver::of(ruby, &node.document_obj())?;
-    let key = create(
-        ruby,
-        &doc,
-        NodeKind::Comment {
-            content: content.to_string()?,
-        },
-    )?;
-    finish(ruby, &doc, key, Some(class), args)
+    let doc = Receiver::of_value(ruby, document)?;
+    let kind = NodeKind::Comment {
+        content: content.to_string()?,
+    };
+    construct(ruby, &doc, kind, Some(class), args)
 }
 
 /// `ProcessingInstruction.new(document, name, content, *rest)`
 fn pi_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
-    let [document, name, content] = at_least(ruby, args, 3)? else {
-        unreachable!()
+    let [document, name, content] = leading(ruby, args)?;
+    let doc = document_receiver(ruby, document)?;
+    let kind = NodeKind::ProcessingInstruction {
+        target: string(name)?,
+        data: Some(string(content)?),
     };
-    let doc = document_receiver(ruby, *document)?;
-    let target = string(*name)?;
-    let data = string(*content)?;
-    let key = create(
-        ruby,
-        &doc,
-        NodeKind::ProcessingInstruction {
-            target,
-            data: Some(data),
-        },
-    )?;
-    finish(ruby, &doc, key, Some(class), args)
+    construct(ruby, &doc, kind, Some(class), args)
 }
 
 /// `EntityReference.new(document, name, *rest)`
 fn entity_reference_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
-    let [document, name] = at_least(ruby, args, 2)? else {
-        unreachable!()
+    let [document, name] = leading(ruby, args)?;
+    let doc = document_receiver(ruby, document)?;
+    let kind = NodeKind::EntityRef {
+        name: string(name)?,
+        value: None,
     };
-    let doc = document_receiver(ruby, *document)?;
-    let name = string(*name)?;
-    let key = create(ruby, &doc, NodeKind::EntityRef { name, value: None })?;
-    finish(ruby, &doc, key, Some(class), args)
+    construct(ruby, &doc, kind, Some(class), args)
 }
 
 /// `Attr.new(document, name, *rest)`: an attribute on no element.
 fn attr_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
-    let [document, name] = at_least(ruby, args, 2)? else {
-        unreachable!()
-    };
+    let [document, name] = leading(ruby, args)?;
     if !document.is_kind_of(classes::get(ruby, &classes::XML_DOCUMENT)) {
         return Err(Error::new(
             ruby.exception_arg_error(),
             "parameter must be a Nokogiri::XML::Document",
         ));
     }
-    let doc = document_receiver(ruby, *document)?;
-    let name = string(*name)?;
+    let doc = document_receiver(ruby, document)?;
+    let name = string(name)?;
     let attribute = Attribute {
         name: name.clone(),
         value: String::new(),
@@ -272,8 +262,7 @@ fn attr_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> 
         namespace: None,
         raw_value: None,
     };
-    let holder = doc.tree_mut(ruby)?.create_node(holder_kind(attribute));
-    doc.state().holders.borrow_mut().insert(holder);
+    let holder = new_holder(&mut *doc.tree_mut(ruby)?, doc.state(), attribute);
     let key = NodeKey::Attr {
         owner: holder,
         prefix: None,
@@ -288,7 +277,7 @@ fn attr_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> 
 /// (no namespace, attributes or children), 2 the node with its namespace
 /// and attributes, anything else the whole subtree.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CopyLevel {
+pub enum CopyLevel {
     Bare,
     Shallow,
     Deep,
@@ -318,7 +307,7 @@ impl CopyLevel {
 
 /// Copies node `id` of `source` into `target`, detached. `source` is `None`
 /// when the copy goes into the same document.
-fn copy_tree_node(
+pub fn copy_tree_node(
     target: &mut Document,
     source: Option<&Document>,
     id: NodeId,
@@ -376,8 +365,7 @@ fn initialize_copy_with_args(
                     "the attribute is no longer on its element",
                 )
             })?;
-            let holder = dst.tree_mut(ruby)?.create_node(holder_kind(attribute));
-            dst.state().holders.borrow_mut().insert(holder);
+            let holder = new_holder(&mut *dst.tree_mut(ruby)?, dst.state(), attribute);
             NodeKey::Attr {
                 owner: holder,
                 prefix: prefix.clone(),
@@ -460,9 +448,12 @@ fn set(ruby: &Ruby, rb_self: &NodeObj, name: String, value: Value) -> Result<Val
     }
     let text = string(value)?;
     let mut tree = rcv.tree_mut(ruby)?;
-    let resolved = name.split_once(':').and_then(|(prefix, local)| {
-        namespace::lookup(&tree, id, Some(prefix)).map(|href| (prefix, local, href))
-    });
+    let resolved = match namespace::split_qname(&name) {
+        (Some(prefix), local) => {
+            namespace::lookup(&tree, id, Some(prefix)).map(|href| (prefix, local, href))
+        }
+        (None, _) => None,
+    };
     match resolved {
         Some((prefix, local, href)) => {
             set_attribute(&mut tree, id, Some(prefix), local, Some(&href), &text);
@@ -485,24 +476,10 @@ fn set_attr_value(ruby: &Ruby, rb_self: &NodeObj, content: Value) -> Result<Valu
 }
 
 fn set_attribute_value(ruby: &Ruby, rcv: &Receiver, value: String) -> Result<(), Error> {
-    let NodeKey::Attr {
-        owner,
-        prefix,
-        name,
-    } = &rcv.key
-    else {
-        return Ok(());
-    };
-    let mut tree = rcv.tree_mut(ruby)?;
-    if let NodeKind::Element { attributes, .. } = tree.kind_mut(*owner)
-        && let Some(attribute) = attributes
-            .iter_mut()
-            .find(|a| a.prefix == *prefix && a.name == *name)
-    {
+    edit_attribute(ruby, rcv.state(), &rcv.key, |attribute| {
         attribute.value = value;
         attribute.raw_value = None;
-    }
-    Ok(())
+    })
 }
 
 /// `Node#lang=(lang)`: sets `xml:lang` on an element.
@@ -613,7 +590,7 @@ fn decode_reference(name: &str) -> Option<char> {
 /// content the way `xmlNodeSetContent` does.
 fn set_native_content(ruby: &Ruby, rb_self: &NodeObj, content: String) -> Result<String, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
-    if let NodeKey::Attr { .. } = rcv.key {
+    let Some(id) = rcv.tree_id() else {
         let decoded: String = content_nodes(&content)
             .into_iter()
             .map(|kind| match kind {
@@ -624,8 +601,7 @@ fn set_native_content(ruby: &Ruby, rb_self: &NodeObj, content: String) -> Result
             .collect();
         set_attribute_value(ruby, &rcv, decoded)?;
         return Ok(content);
-    }
-    let id = rcv.tree_id().expect("a tree node");
+    };
     let mut tree = rcv.tree_mut(ruby)?;
     let children: Vec<NodeId> = tree.children(id).collect();
     for child in children {
@@ -660,28 +636,9 @@ fn set_node_name(ruby: &Ruby, rb_self: &NodeObj, new_name: String) -> Result<Str
                 _ => {}
             }
         }
-        key @ NodeKey::Attr {
-            owner,
-            prefix,
-            name,
-        } => {
-            {
-                let mut tree = rcv.tree_mut(ruby)?;
-                if let NodeKind::Element { attributes, .. } = tree.kind_mut(*owner)
-                    && let Some(attribute) = attributes
-                        .iter_mut()
-                        .find(|a| a.prefix == *prefix && a.name == *name)
-                {
-                    attribute.name.clone_from(&new_name);
-                }
-            }
-            let renamed = NodeKey::Attr {
-                owner: *owner,
-                prefix: prefix.clone(),
-                name: new_name.clone(),
-            };
-            rekey(ruby, rcv.state(), key, renamed)?;
-        }
+        key @ NodeKey::Attr { .. } => edit_attribute(ruby, rcv.state(), key, |attribute| {
+            attribute.name.clone_from(&new_name);
+        })?,
     }
     Ok(new_name)
 }

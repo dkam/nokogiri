@@ -16,8 +16,11 @@ use xmloxide::tree::NodeKind;
 use xmloxide::{Document, NodeId};
 
 use crate::classes;
+use crate::edit::{CopyLevel, copy_tree_node};
 use crate::namespace;
-use crate::node::{NodeKey, NodeObj, Receiver, attr_key, rekey, repoint, retarget_subtree};
+use crate::node::{
+    NodeKey, NodeObj, Receiver, attr_key, edit_attribute, rekey, repoint, retarget_subtree,
+};
 
 pub fn init(ruby: &Ruby) -> Result<(), Error> {
     let node = classes::get(ruby, &classes::NODE);
@@ -66,15 +69,11 @@ enum Type {
     Pi,
     EntityRef,
     Dtd,
-    Attribute,
     Fragment,
 }
 
-fn type_of(tree: &Document, key: &NodeKey) -> Type {
-    let NodeKey::Tree(id) = key else {
-        return Type::Attribute;
-    };
-    match tree.node(*id).kind {
+fn type_of(tree: &Document, id: NodeId) -> Type {
+    match tree.node(id).kind {
         NodeKind::Document => Type::Document,
         NodeKind::Element { .. } => Type::Element,
         NodeKind::Text { .. } => Type::Text,
@@ -90,7 +89,7 @@ fn type_of(tree: &Document, key: &NodeKey) -> Type {
 /// The DOM's parent–child rules, as the C extension applies them (with text
 /// allowed directly under a document, for compatibility).
 fn allowed(parent: Type, child: Type) -> bool {
-    use Type::{Attribute, CData, Comment, Document, Dtd, Element, EntityRef, Fragment, Pi, Text};
+    use Type::{CData, Comment, Document, Dtd, Element, EntityRef, Fragment, Pi, Text};
     match parent {
         Document => matches!(
             child,
@@ -99,7 +98,6 @@ fn allowed(parent: Type, child: Type) -> bool {
         Fragment | Element | EntityRef => {
             matches!(child, Element | Pi | Comment | Text | CData | EntityRef)
         }
-        Attribute => matches!(child, Text | EntityRef),
         _ => false,
     }
 }
@@ -116,17 +114,6 @@ fn append_text(tree: &mut Document, id: NodeId, extra: &str) {
     if let NodeKind::Text { content } = tree.kind_mut(id) {
         content.push_str(extra);
     }
-}
-
-fn is_ancestor_or_self(tree: &Document, ancestor: NodeId, node: NodeId) -> bool {
-    let mut current = Some(node);
-    while let Some(id) = current {
-        if id == ancestor {
-            return true;
-        }
-        current = tree.parent(id);
-    }
-    false
 }
 
 fn cannot_reparent(ruby: &Ruby, node: Value) -> Error {
@@ -151,35 +138,36 @@ fn reparent(ruby: &Ruby, rb_self: &NodeObj, node: Value, op: Op) -> Result<Value
     let pivot = Receiver::of(ruby, rb_self)?;
     let node_obj = Obj::<NodeObj>::try_convert(node)?;
     let moving = Receiver::of(ruby, &node_obj)?;
+    let (pivot_id, original) = match (&pivot.key, &moving.key) {
+        (NodeKey::Tree(pivot_id), NodeKey::Tree(original)) => (*pivot_id, *original),
+        // An attribute's children are its value.
+        (NodeKey::Attr { .. }, _) if op == Op::AddChild => {
+            return add_to_attribute(ruby, &pivot, &moving, node);
+        }
+        // An attribute can't be moved, nor have siblings.
+        _ => return Err(cannot_reparent(ruby, node)),
+    };
 
     // The parent the node will have, and whether it may have it.
-    let moving_type = type_of(&moving.tree(), &moving.key);
-    let parent = match (op, &pivot.key) {
-        (Op::AddChild, _) => Some(pivot.key.clone()),
-        (_, NodeKey::Tree(id)) => pivot.tree().parent(*id).map(NodeKey::Tree),
-        (_, NodeKey::Attr { .. }) => return Err(cannot_reparent(ruby, node)),
+    let parent = match op {
+        Op::AddChild => Some(pivot_id),
+        _ => pivot.tree().parent(pivot_id),
     };
-    if let Some(parent) = &parent
-        && !allowed(type_of(&pivot.tree(), parent), moving_type)
+    if let Some(parent) = parent
+        && !allowed(
+            type_of(&pivot.tree(), parent),
+            type_of(&moving.tree(), original),
+        )
     {
         return Err(cannot_reparent(ruby, node));
     }
-    if let NodeKey::Attr { .. } = pivot.key {
-        return add_to_attribute(ruby, &pivot, &moving, node);
-    }
-    let NodeKey::Tree(pivot_id) = pivot.key else {
-        unreachable!("attributes handled above")
-    };
-    let NodeKey::Tree(original) = moving.key else {
-        unreachable!("attributes can't be reparented")
-    };
     let same_document = moving.doc_value.as_raw() == pivot.doc_value.as_raw();
 
     // A node can't become its own descendant. libxml2 notices after the
     // fact; an arena would loop, so check first.
     if same_document
-        && let Some(NodeKey::Tree(parent)) = parent
-        && is_ancestor_or_self(&pivot.tree(), original, parent)
+        && let Some(parent) = parent
+        && pivot.tree().ancestors(parent).any(|id| id == original)
     {
         let name = pivot
             .tree()
@@ -191,10 +179,7 @@ fn reparent(ruby: &Ruby, rb_self: &NodeObj, node: Value, op: Op) -> Result<Value
             format!("cycle detected: node '{name}' is an ancestor of itself"),
         ));
     }
-    let sibling_op = matches!(
-        op,
-        Op::AddPreviousSibling | Op::AddNextSibling | Op::Replace
-    );
+    let sibling_op = op != Op::AddChild;
     if sibling_op && same_document && original == pivot_id {
         // Unlinking the node unlinks the pivot too; libxml2 then fails.
         return Err(Error::new(
@@ -215,13 +200,12 @@ fn reparent(ruby: &Ruby, rb_self: &NodeObj, node: Value, op: Op) -> Result<Value
         pivot.tree_mut(ruby)?.detach(original);
         original
     } else {
-        let copy = {
-            let source = moving.tree();
-            let mut target = pivot.tree_mut(ruby)?;
-            let copy = target.import_node(&source, original);
-            namespace::declare_missing(&mut target, copy);
-            copy
-        };
+        let copy = copy_tree_node(
+            &mut *pivot.tree_mut(ruby)?,
+            Some(&moving.tree()),
+            original,
+            CopyLevel::Deep,
+        );
         retarget_subtree(ruby, &moving, original, &pivot, copy)?;
         moving.tree_mut(ruby)?.detach(original);
         copy
@@ -331,31 +315,11 @@ fn add_to_attribute(
         _ => return Err(cannot_reparent(ruby, node)),
     };
     moving.tree_mut(ruby)?.detach(id);
-    let NodeKey::Attr {
-        owner,
-        prefix,
-        name,
-    } = &pivot.key
-    else {
-        unreachable!("the pivot is an attribute")
-    };
-    if let NodeKind::Element { attributes, .. } = pivot.tree_mut(ruby)?.kind_mut(*owner)
-        && let Some(attribute) = attributes
-            .iter_mut()
-            .find(|a| a.prefix == *prefix && a.name == *name)
-    {
+    edit_attribute(ruby, pivot.state(), &pivot.key, |attribute| {
         attribute.value.push_str(&text);
         attribute.raw_value = None;
-    }
+    })?;
     Ok(node)
-}
-
-/// Splits `prefix:local`.
-fn split_qname(name: &str) -> (Option<&str>, &str) {
-    match name.split_once(':') {
-        Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => (Some(prefix), local),
-        _ => (None, name),
-    }
 }
 
 /// Nokogiri's `relink_namespace`: after a move, an element (or attribute)
@@ -376,7 +340,7 @@ fn relink(tree: &mut Document, id: NodeId, inherit: bool, rekeys: &mut Vec<(Node
         return;
     };
     if namespace.is_none() || prefix.is_none() {
-        let (qprefix, local) = split_qname(name);
+        let (qprefix, local) = namespace::split_qname(name);
         if let Some(href) = namespace::lookup(tree, id, qprefix) {
             let qprefix = qprefix.map(str::to_owned);
             let local = local.to_owned();
@@ -451,7 +415,7 @@ fn relink_attributes(tree: &mut Document, id: NodeId, rekeys: &mut Vec<(NodeKey,
         .enumerate()
         .filter(|(_, a)| a.prefix.is_none() && namespace::declaration(a).is_none())
         .filter_map(|(index, a)| {
-            let (prefix, local) = split_qname(&a.name);
+            let (prefix, local) = namespace::split_qname(&a.name);
             let prefix = prefix.filter(|p| *p != "xmlns")?;
             let href = namespace::lookup(tree, id, Some(prefix))?;
             Some((index, prefix.to_owned(), local.to_owned(), href))

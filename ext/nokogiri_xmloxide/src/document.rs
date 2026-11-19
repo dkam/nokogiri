@@ -10,8 +10,8 @@ use xmloxide::error::ParseError;
 use xmloxide::parser::{ParseOptions, parse_str_with_options};
 
 use crate::classes;
+use crate::edit::{CopyLevel, copy_tree_node};
 use crate::encoding_handler;
-use crate::namespace;
 use crate::node::{DocKind, DocState, NodeObj, Receiver, document_receiver};
 use crate::syntax_error;
 
@@ -80,7 +80,7 @@ pub fn parser_options(options: i64) -> ParseOptions {
 /// registered with `EncodingHandler.alias` resolve to their encodings, both
 /// for `encoding` and in the declaration.
 fn decode(bytes: &[u8], encoding: Option<&str>) -> Result<String, EncodingError> {
-    use xmloxide::encoding::{decode_to_utf8, transcode};
+    use xmloxide::encoding::{declared_encoding, decode_to_utf8, transcode};
     if let Some(name) = encoding {
         let real = encoding_handler::resolve_alias(name);
         return transcode(bytes, real.as_deref().unwrap_or(name));
@@ -91,27 +91,6 @@ fn decode(bytes: &[u8], encoding: Option<&str>) -> Result<String, EncodingError>
             None => Err(failure),
         }
     })
-}
-
-/// The `encoding` named in an ASCII-compatible XML declaration.
-fn declared_encoding(bytes: &[u8]) -> Option<String> {
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let head = &bytes[..bytes.len().min(200)];
-    let decl = &head[..head.windows(2).position(|w| w == b"?>")?];
-    if !decl.starts_with(b"<?xml") {
-        return None;
-    }
-    let after = &decl[decl.windows(8).position(|w| w == b"encoding")? + 8..];
-    let after = after
-        .trim_ascii_start()
-        .strip_prefix(b"=")?
-        .trim_ascii_start();
-    let (&quote, rest) = after.split_first()?;
-    if quote != b'"' && quote != b'\'' {
-        return None;
-    }
-    let value = &rest[..rest.iter().position(|&b| b == quote)?];
-    String::from_utf8(value.to_vec()).ok()
 }
 
 /// Decodes and parses.
@@ -292,7 +271,7 @@ fn set_encoding(ruby: &Ruby, rb_self: &NodeObj, encoding: String) -> Result<Stri
 /// keeps referring to the original.
 fn set_root(ruby: &Ruby, rb_self: &NodeObj, new_root: Value) -> Result<Value, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
-    let new_root_rcv = if new_root.is_nil() {
+    let attach = if new_root.is_nil() {
         None
     } else {
         if !new_root.is_kind_of(classes::get(ruby, &classes::NODE)) {
@@ -305,31 +284,27 @@ fn set_root(ruby: &Ruby, rb_self: &NodeObj, new_root: Value) -> Result<Value, Er
             ));
         }
         let node = Receiver::of_value(ruby, new_root)?;
-        let is_element = node.tree_id().is_some_and(|id| node.tree().is_element(id));
-        if !is_element {
+        let Some(id) = node.tree_id().filter(|id| node.tree().is_element(*id)) else {
             return Err(Error::new(
                 ruby.exception_type_error(),
                 "root must be a Nokogiri::XML::Element",
             ));
+        };
+        if node.doc_value.as_raw() == rcv.doc_value.as_raw() {
+            Some(id)
+        } else {
+            Some(copy_tree_node(
+                &mut *rcv.tree_mut(ruby)?,
+                Some(&node.tree()),
+                id,
+                CopyLevel::Deep,
+            ))
         }
-        Some(node)
-    };
-    let same_document = |node: &Receiver| node.doc_value.as_raw() == rcv.doc_value.as_raw();
-    let copied = match &new_root_rcv {
-        Some(node) if !same_document(node) => {
-            let source = node.tree();
-            let mut tree = rcv.tree_mut(ruby)?;
-            let copy = tree.import_node(&source, node.tree_id().expect("an element"));
-            namespace::declare_missing(&mut tree, copy);
-            Some(copy)
-        }
-        _ => None,
     };
     let mut tree = rcv.tree_mut(ruby)?;
     if let Some(current) = tree.root_element() {
         tree.detach(current);
     }
-    let attach = copied.or_else(|| new_root_rcv.as_ref().and_then(Receiver::tree_id));
     if let Some(id) = attach {
         tree.detach(id);
         let document_node = tree.root();

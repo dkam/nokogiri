@@ -20,7 +20,7 @@ use xmloxide::tree::NodeKind;
 use crate::classes;
 use crate::document::parser_options;
 use crate::namespace;
-use crate::node::{NodeKey, NodeObj, Receiver, document_receiver, wrap_as};
+use crate::node::{NodeKey, NodeObj, Receiver, document_receiver, escape_attribute, wrap_as};
 use crate::node_set;
 use crate::syntax_error;
 
@@ -49,27 +49,13 @@ fn native_new(ruby: &Ruby, class: RClass, document: Value) -> Result<Value, Erro
     )
 }
 
-fn escape_attribute(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('"', "&quot;")
+/// The wrapper document: `markup` after the wrapper's `prefix`, closed.
+fn wrap_markup(prefix: &str, markup: &str) -> String {
+    format!("{prefix}{markup}</{CONTEXT_ROOT}>")
 }
 
-/// The wrapper document text: `markup` inside a root that declares
-/// `namespaces`, behind the internal `subset`, if any.
-fn wrap_markup(
-    markup: &str,
-    namespaces: &[(Option<String>, String)],
-    subset: Option<&str>,
-) -> String {
-    let mut text = wrapper_prefix(namespaces, subset);
-    text.push_str(markup);
-    let _ = write!(text, "</{CONTEXT_ROOT}>");
-    text
-}
-
-/// Everything the wrapper puts before the markup.
+/// Everything the wrapper puts before the markup: the internal `subset`, if
+/// any, and a root that declares `namespaces`.
 fn wrapper_prefix(namespaces: &[(Option<String>, String)], subset: Option<&str>) -> String {
     let mut text = String::with_capacity(128);
     if let Some(subset) = subset {
@@ -129,22 +115,21 @@ fn in_context(
     options: i64,
 ) -> Result<Value, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
-    // Copied out before any further Ruby call.
-    let markup = String::from_utf8_lossy(unsafe { markup.as_slice() }).into_owned();
-    let (namespaces, subset) = {
+    let prefix = {
         let tree = rcv.tree();
-        let anchor = match &rcv.key {
-            NodeKey::Tree(id) => *id,
-            NodeKey::Attr { owner, .. } => *owner,
-        };
-        let namespaces: Vec<(Option<String>, String)> = namespace::in_scope(&tree, anchor)
-            .into_iter()
-            .map(|(key, href)| (key.prefix, href))
-            .collect();
-        (namespaces, internal_subset(&tree))
+        let namespaces: Vec<(Option<String>, String)> =
+            namespace::in_scope(&tree, rcv.key.anchor())
+                .into_iter()
+                .map(|(key, href)| (key.prefix, href))
+                .collect();
+        wrapper_prefix(&namespaces, internal_subset(&tree).as_deref())
     };
-    let wrapper = wrap_markup(&markup, &namespaces, subset.as_deref());
-    let prefix = wrapper_prefix(&namespaces, subset.as_deref());
+    // The markup is borrowed from the Ruby string only until it is copied
+    // into the wrapper, before any further Ruby call.
+    let wrapper = wrap_markup(
+        &prefix,
+        &String::from_utf8_lossy(unsafe { markup.as_slice() }),
+    );
     let mut parsed = parse_str_with_options(&wrapper, &parser_options(options));
     let diagnostics = match &mut parsed {
         Ok(tree) => &mut tree.diagnostics,
@@ -215,8 +200,9 @@ mod tests {
             (Some("p".to_owned()), "urn:p".to_owned()),
             (None, "urn:\"d\"".to_owned()),
         ];
+        let prefix = wrapper_prefix(&namespaces, Some("<!ENTITY e 'x'>"));
         assert_eq!(
-            wrap_markup("<p:a/>", &namespaces, Some("<!ENTITY e 'x'>")),
+            wrap_markup(&prefix, "<p:a/>"),
             "<!DOCTYPE nokogiri-xmloxide-context [<!ENTITY e 'x'>]>\
              <nokogiri-xmloxide-context xmlns:p=\"urn:p\" xmlns=\"urn:&quot;d&quot;\">\
              <p:a/></nokogiri-xmloxide-context>"

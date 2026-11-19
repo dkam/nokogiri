@@ -23,7 +23,7 @@ use xmloxide::xpath::parser::parse;
 use xmloxide::xpath::{XPathError, XPathNode, XPathValue};
 
 use crate::classes;
-use crate::node::{NodeKey, NodeObj, Receiver, attr_key};
+use crate::node::{NodeKey, NodeObj, Receiver, attr_index, attr_key, is_xml_blank};
 use crate::node_set::{self, NodeSetObj};
 use crate::syntax_error::{self, XPathCode};
 use crate::warnings;
@@ -99,18 +99,22 @@ fn set_node(ruby: &Ruby, rb_self: &XPathContextObj, node: Value) -> Result<Value
     Ok(node)
 }
 
+/// Binds `key` to `value` in `map`, or unbinds it if `value` is nil.
+fn bind(map: &RefCell<HashMap<String, String>>, key: String, value: Option<String>) {
+    let mut map = map.borrow_mut();
+    match value {
+        Some(value) => map.insert(key, value),
+        None => map.remove(&key),
+    };
+}
+
 /// `register_ns(prefix, uri)`; a nil `uri` unregisters the prefix.
 fn register_ns(
     rb_self: Obj<XPathContextObj>,
     prefix: String,
     uri: Option<String>,
 ) -> Obj<XPathContextObj> {
-    let mut namespaces = rb_self.namespaces.borrow_mut();
-    match uri {
-        Some(uri) => namespaces.insert(prefix, uri),
-        None => namespaces.remove(&prefix),
-    };
-    drop(namespaces);
+    bind(&rb_self.namespaces, prefix, uri);
     rb_self
 }
 
@@ -121,32 +125,16 @@ fn register_variable(
     name: String,
     value: Option<String>,
 ) -> Obj<XPathContextObj> {
-    let mut variables = rb_self.variables.borrow_mut();
-    match value {
-        Some(value) => variables.insert(name, value),
-        None => variables.remove(&name),
-    };
-    drop(variables);
+    bind(&rb_self.variables, name, value);
     rb_self
 }
 
 /// `evaluate(search_path, handler = nil)`: a NodeSet, String, Float, or
 /// boolean.
 fn evaluate(ruby: &Ruby, rb_self: &XPathContextObj, args: &[Value]) -> Result<Value, Error> {
-    let (expression, handler) = match args {
-        [expression] => (*expression, None),
-        [expression, handler] => (*expression, Some(*handler).filter(|h| !h.is_nil())),
-        _ => {
-            return Err(Error::new(
-                ruby.exception_arg_error(),
-                format!(
-                    "wrong number of arguments (given {}, expected 1..2)",
-                    args.len()
-                ),
-            ));
-        }
-    };
-    let expression = RString::try_convert(expression)?.to_string()?;
+    ruby.check_arity(args.len(), 1..=2)?;
+    let expression = RString::try_convert(args[0])?.to_string()?;
+    let handler = args.get(1).copied().filter(|h| !h.is_nil());
     let parsed = parse(&expression)
         .map_err(|err| syntax_error::xpath_error(ruby, &err.into(), &expression))?;
 
@@ -158,6 +146,7 @@ fn evaluate(ruby: &Ruby, rb_self: &XPathContextObj, args: &[Value]) -> Result<Va
         handler,
         expression: &expression,
         failure: RefCell::new(None),
+        known: RefCell::new(HashMap::new()),
     };
     let namespaces = rb_self.namespaces.borrow().clone();
     let variables = rb_self.variables.borrow().clone();
@@ -231,17 +220,10 @@ impl Outcome {
 fn xpath_node(tree: &Document, key: &NodeKey) -> Option<XPathNode> {
     match key {
         NodeKey::Tree(id) => Some(XPathNode::Node(*id)),
-        NodeKey::Attr {
-            owner,
-            prefix,
-            name,
-        } => {
-            let index = tree
-                .attributes(*owner)
-                .iter()
-                .position(|a| a.prefix == *prefix && a.name == *name)?;
+        NodeKey::Attr { .. } => {
+            let (owner, index) = attr_index(tree, key)?;
             Some(XPathNode::Attribute {
-                owner: *owner,
+                owner,
                 index: u32::try_from(index).ok()?,
             })
         }
@@ -270,6 +252,10 @@ struct Functions<'a> {
     handler: Option<Value>,
     expression: &'a str,
     failure: RefCell<Option<Error>>,
+    /// Whether the handler has each function (by name, and whether it was
+    /// called without a namespace), asked once per query, as libxml2 looks a
+    /// function up once per call site.
+    known: RefCell<HashMap<(String, bool), bool>>,
 }
 
 impl FunctionResolver for Functions<'_> {
@@ -289,19 +275,16 @@ impl FunctionResolver for Functions<'_> {
                 _ => {}
             }
         }
-        // Like the C extension, any namespace reaches the handler.
         let handler = self.handler?;
-        match handler.respond_to(name, false) {
+        match self.handles(handler, name, namespace.is_none()) {
             Ok(true) => {}
             Ok(false) => return None,
             Err(error) => return Some(Err(self.fail(error))),
         }
-        if namespace.is_none()
-            && let Err(error) = self.warn_unnamespaced(name)
-        {
-            return Some(Err(self.fail(error)));
-        }
-        Some(self.invoke(handler, name, call))
+        Some(call.args().and_then(|args| {
+            self.invoke(handler, name, call.document(), args)
+                .map_err(|error| self.fail(error))
+        }))
     }
 }
 
@@ -312,18 +295,28 @@ fn aborted() -> XPathError {
 }
 
 impl Functions<'_> {
-    /// The deprecation warning for a handler function called without a
-    /// namespace.
-    fn warn_unnamespaced(&self, name: &str) -> Result<(), Error> {
-        warnings::deprecated(
-            self.ruby,
-            &format!(
-                "A custom XPath or CSS handler function named '{name}' is being invoked \
-                 without a namespace. Please update your query to reference this function \
-                 as 'nokogiri:{name}'. Invoking custom handler functions without a namespace \
-                 is deprecated and will become an error in Nokogiri v1.17.0."
-            ),
-        )
+    /// Whether the handler has function `name`. Like the C extension, any
+    /// namespace reaches the handler; a name without one is deprecated.
+    fn handles(&self, handler: Value, name: &str, unprefixed: bool) -> Result<bool, Error> {
+        let key = (name.to_owned(), unprefixed);
+        let cached = self.known.borrow().get(&key).copied();
+        if let Some(known) = cached {
+            return Ok(known);
+        }
+        let responds = handler.respond_to(name, false)?;
+        if responds && unprefixed {
+            warnings::deprecated(
+                self.ruby,
+                &format!(
+                    "A custom XPath or CSS handler function named '{name}' is being invoked \
+                     without a namespace. Please update your query to reference this function \
+                     as 'nokogiri:{name}'. Invoking custom handler functions without a \
+                     namespace is deprecated and will become an error in Nokogiri v1.17.0."
+                ),
+            )?;
+        }
+        self.known.borrow_mut().insert(key, responds);
+        Ok(responds)
     }
 
     fn fail(&self, error: Error) -> XPathError {
@@ -331,62 +324,42 @@ impl Functions<'_> {
         aborted()
     }
 
-    /// Calls the handler method, marshalling arguments and the result the
-    /// way `Nokogiri_marshal_xpath_funcall_and_return_values` does.
+    /// Calls the handler method with the evaluated arguments, marshalling
+    /// them and the result the way
+    /// `Nokogiri_marshal_xpath_funcall_and_return_values` does.
     fn invoke(
         &self,
         handler: Value,
         name: &str,
-        call: &ExtensionCall<'_, '_>,
-    ) -> Result<XPathValue, XPathError> {
-        let values = call.args()?;
-        let ruby = self.ruby;
+        tree: &Document,
+        values: Vec<XPathValue>,
+    ) -> Result<XPathValue, Error> {
         // A Ruby Array, not a Vec, so the arguments stay visible to the GC.
-        let args = ruby.ary_new_capa(values.len());
-        for value in &values {
-            let arg = self
-                .ruby_value(call.document(), value)
-                .map_err(|e| self.fail(e))?;
-            args.push(arg).map_err(|e| self.fail(e))?;
+        let args = self.ruby.ary_new_capa(values.len());
+        for value in values {
+            args.push(Outcome::of(tree, value).into_ruby(self.ruby, self.rcv)?)?;
         }
         // SAFETY: nothing touches `args` between borrowing the slice and
         // the call copying it onto the Ruby stack.
-        let returned: Result<Value, Error> = handler.funcall(name, unsafe { args.as_slice() });
-        let returned = returned.map_err(|e| self.fail(e))?;
-        self.returned_value(call.document(), returned)
+        let returned: Value = handler.funcall(name, unsafe { args.as_slice() })?;
+        self.returned_value(tree, returned)
     }
 
-    fn ruby_value(&self, tree: &Document, value: &XPathValue) -> Result<Value, Error> {
-        let ruby = self.ruby;
-        Ok(match value {
-            XPathValue::NodeSet(nodes) => {
-                let keys = nodes.iter().map(|n| node_key(tree, *n)).collect();
-                let nodes = self.rcv.wrap_all(ruby, keys)?;
-                node_set::new(ruby, self.rcv.doc_value, nodes)?
-            }
-            XPathValue::String(s) => ruby.str_new(s).as_value(),
-            XPathValue::Number(n) => ruby.float_from_f64(*n).as_value(),
-            XPathValue::Boolean(b) => b.into_value_with(ruby),
-        })
-    }
-
-    fn returned_value(&self, tree: &Document, value: Value) -> Result<XPathValue, XPathError> {
+    fn returned_value(&self, tree: &Document, value: Value) -> Result<XPathValue, Error> {
         let ruby = self.ruby;
         if Float::from_value(value).is_some() || Integer::from_value(value).is_some() {
-            return f64::try_convert(value)
-                .map(XPathValue::Number)
-                .map_err(|e| self.fail(e));
+            return f64::try_convert(value).map(XPathValue::Number);
         }
         if let Some(s) = RString::from_value(value) {
-            return s
-                .to_string()
-                .map(XPathValue::String)
-                .map_err(|e| self.fail(e));
+            return s.to_string().map(XPathValue::String);
         }
         if value.is_nil() {
             // The function left nothing on libxml2's value stack.
-            let error = syntax_error::xpath(ruby, XPathCode::StackError, self.expression);
-            return Err(self.fail(error));
+            return Err(syntax_error::xpath(
+                ruby,
+                XPathCode::StackError,
+                self.expression,
+            ));
         }
         if value.as_raw() == ruby.qtrue().as_raw() {
             return Ok(XPathValue::Boolean(true));
@@ -396,20 +369,19 @@ impl Functions<'_> {
         }
         let set = if RArray::from_value(value).is_some() {
             let class = classes::get(ruby, &classes::NODE_SET);
-            class
-                .new_instance((self.rcv.doc_value, value))
-                .map_err(|e| self.fail(e))?
+            class.new_instance((self.rcv.doc_value, value))?
         } else if Obj::<NodeSetObj>::try_convert(value).is_ok() {
             value
         } else {
-            let error = Error::new(ruby.exception_runtime_error(), "Invalid return type");
-            return Err(self.fail(error));
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                "Invalid return type",
+            ));
         };
-        let members = node_set::members(set).map_err(|e| self.fail(e))?;
-        let mut nodes = Vec::with_capacity(members.len());
-        for member in members {
-            nodes.push(self.member_node(tree, member).map_err(|e| self.fail(e))?);
-        }
+        let nodes = node_set::members(set)?
+            .into_iter()
+            .map(|member| self.member_node(tree, member))
+            .collect::<Result<_, _>>()?;
         Ok(XPathValue::NodeSet(nodes))
     }
 
@@ -435,7 +407,7 @@ impl Functions<'_> {
 /// `nokogiri-builtin:css-class(hay, needle)`: whether `needle` is one of
 /// the whitespace-separated words of `hay`.
 fn css_class(call: &ExtensionCall<'_, '_>) -> Result<XPathValue, XPathError> {
-    check_arity("css-class", call, 2)?;
+    call.check_arg_count("css-class", 2)?;
     let args = call.args()?;
     let hay = call.string(&args[0]);
     let needle = call.string(&args[1]);
@@ -448,7 +420,6 @@ fn css_class(call: &ExtensionCall<'_, '_>) -> Result<XPathValue, XPathError> {
 /// A port of `_noko_xml_xpath_context__css_class`: does a word of `hay`
 /// start with `needle`, followed by a blank or the end?
 fn contains_class(hay: &[u8], needle: &[u8]) -> bool {
-    let blank = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
     if needle.is_empty() {
         return true;
     }
@@ -456,14 +427,14 @@ fn contains_class(hay: &[u8], needle: &[u8]) -> bool {
     while i < hay.len() {
         if hay[i..].starts_with(needle) {
             let next = i + needle.len();
-            if next == hay.len() || blank(hay[next]) {
+            if next == hay.len() || is_xml_blank(hay[next]) {
                 return true;
             }
         }
-        while i < hay.len() && !blank(hay[i]) {
+        while i < hay.len() && !is_xml_blank(hay[i]) {
             i += 1;
         }
-        while i < hay.len() && blank(hay[i]) {
+        while i < hay.len() && is_xml_blank(hay[i]) {
             i += 1;
         }
     }
@@ -474,7 +445,7 @@ fn contains_class(hay: &[u8], needle: &[u8]) -> bool {
 /// is `name`, ignoring namespaces (for HTML5 CSS queries).
 fn local_name_is(call: &ExtensionCall<'_, '_>) -> Result<XPathValue, XPathError> {
     use xmloxide::tree::NodeKind;
-    check_arity("local-name-is", call, 1)?;
+    call.check_arg_count("local-name-is", 1)?;
     let args = call.args()?;
     let wanted = call.string(&args[0]);
     let doc = call.document();
@@ -492,22 +463,6 @@ fn local_name_is(call: &ExtensionCall<'_, '_>) -> Result<XPathValue, XPathError>
             .map(|a| a.name.as_str()),
     };
     Ok(XPathValue::Boolean(name == Some(wanted.as_str())))
-}
-
-fn check_arity(
-    function: &str,
-    call: &ExtensionCall<'_, '_>,
-    expected: usize,
-) -> Result<(), XPathError> {
-    if call.arg_count() == expected {
-        Ok(())
-    } else {
-        Err(XPathError::InvalidArgCount {
-            function: function.to_owned(),
-            expected,
-            found: call.arg_count(),
-        })
-    }
 }
 
 #[cfg(test)]

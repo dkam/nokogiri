@@ -67,6 +67,16 @@ pub enum NodeKey {
     },
 }
 
+impl NodeKey {
+    /// The tree node this key is at: the node, or an attribute's element.
+    pub fn anchor(&self) -> NodeId {
+        match self {
+            Self::Tree(id) => *id,
+            Self::Attr { owner, .. } => *owner,
+        }
+    }
+}
+
 struct Handle {
     /// The Ruby `Document` (the object itself, for documents).
     document: Opaque<Value>,
@@ -231,6 +241,17 @@ impl Receiver {
         self.doc
     }
 
+    /// The node's parent: for an attribute, its element, unless the
+    /// attribute has been detached.
+    pub fn parent_id(&self) -> Option<NodeId> {
+        match &self.key {
+            NodeKey::Tree(id) => self.tree().parent(*id),
+            NodeKey::Attr { owner, .. } => {
+                (!self.state().holders.borrow().contains(owner)).then_some(*owner)
+            }
+        }
+    }
+
     pub fn tree_id(&self) -> Option<NodeId> {
         match self.key {
             NodeKey::Tree(id) => Some(id),
@@ -388,6 +409,9 @@ pub fn retarget_subtree(
     to: &Receiver,
     copy: NodeId,
 ) -> Result<(), Error> {
+    if from.state().cache.borrow().is_empty() {
+        return Ok(());
+    }
     let pairs: Vec<(NodeKey, NodeKey)> = {
         let source = from.tree();
         let target = to.tree();
@@ -419,56 +443,41 @@ pub fn retarget_subtree(
 /// the attribute moves to a detached holder element, so the object keeps
 /// its name and value, as an unlinked `xmlAttr` does in libxml2.
 pub fn remove_attribute(ruby: &Ruby, doc: &DocState, key: &NodeKey) -> Result<(), Error> {
-    let NodeKey::Attr {
-        owner,
-        prefix,
-        name,
-    } = key
-    else {
-        return Ok(());
-    };
-    if doc.holders.borrow().contains(owner) {
+    if doc.holders.borrow().contains(&key.anchor()) {
         return Ok(());
     }
     let wrapped = doc.cache.borrow().contains_key(key);
     let holder = {
         let mut tree = tree_mut(ruby, doc)?;
-        let NodeKind::Element { attributes, .. } = tree.kind_mut(*owner) else {
+        let Some((owner, index)) = attr_index(&tree, key) else {
             return Ok(());
         };
-        let Some(index) = attributes
-            .iter()
-            .position(|a| a.prefix == *prefix && a.name == *name)
-        else {
+        let NodeKind::Element { attributes, .. } = tree.kind_mut(owner) else {
             return Ok(());
         };
         let attribute = attributes.remove(index);
         if !wrapped {
             return Ok(());
         }
-        tree.create_node(holder_kind(attribute))
+        new_holder(&mut tree, doc, attribute)
     };
-    doc.holders.borrow_mut().insert(holder);
-    rekey(
-        ruby,
-        doc,
-        key,
-        NodeKey::Attr {
-            owner: holder,
-            prefix: prefix.clone(),
-            name: name.clone(),
-        },
-    )
+    let mut moved = key.clone();
+    if let NodeKey::Attr { owner, .. } = &mut moved {
+        *owner = holder;
+    }
+    rekey(ruby, doc, key, moved)
 }
 
-/// A holder element for one detached attribute.
-pub fn holder_kind(attribute: Attribute) -> NodeKind {
-    NodeKind::Element {
+/// A detached holder element for `attribute`, an attribute on no element.
+pub fn new_holder(tree: &mut Document, doc: &DocState, attribute: Attribute) -> NodeId {
+    let holder = tree.create_node(NodeKind::Element {
         name: String::new(),
         prefix: None,
         namespace: None,
         attributes: vec![attribute],
-    }
+    });
+    doc.holders.borrow_mut().insert(holder);
+    holder
 }
 
 fn class_for(ruby: &Ruby, kind: &NodeKind) -> RClass {
@@ -516,6 +525,55 @@ pub fn find_attr<'t>(tree: &'t Document, key: &NodeKey) -> Option<&'t Attribute>
     attributes_of(tree, *owner).find(|a| a.prefix == *prefix && a.name == *name)
 }
 
+/// Where the attribute an `Attr` key names is: its element, and its index
+/// among the element's attributes.
+pub fn attr_index(tree: &Document, key: &NodeKey) -> Option<(NodeId, usize)> {
+    let NodeKey::Attr {
+        owner,
+        prefix,
+        name,
+    } = key
+    else {
+        return None;
+    };
+    let index = tree
+        .attributes(*owner)
+        .iter()
+        .position(|a| a.prefix == *prefix && a.name == *name)?;
+    Some((*owner, index))
+}
+
+/// The attribute an `Attr` key names, for modification.
+fn attr_mut<'t>(tree: &'t mut Document, key: &NodeKey) -> Option<&'t mut Attribute> {
+    let (owner, index) = attr_index(tree, key)?;
+    match tree.kind_mut(owner) {
+        NodeKind::Element { attributes, .. } => attributes.get_mut(index),
+        _ => None,
+    }
+}
+
+/// Changes the attribute an `Attr` key names. If the change renames it (its
+/// prefix or name), its Ruby object moves to the new key.
+pub fn edit_attribute(
+    ruby: &Ruby,
+    doc: &DocState,
+    key: &NodeKey,
+    change: impl FnOnce(&mut Attribute),
+) -> Result<(), Error> {
+    let renamed = {
+        let mut tree = tree_mut(ruby, doc)?;
+        let Some(attribute) = attr_mut(&mut tree, key) else {
+            return Ok(());
+        };
+        change(attribute);
+        attr_key(key.anchor(), attribute)
+    };
+    if renamed != *key {
+        rekey(ruby, doc, key, renamed)?;
+    }
+    Ok(())
+}
+
 // --- Methods --------------------------------------------------------------
 
 pub fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -556,15 +614,11 @@ pub fn init(ruby: &Ruby) -> Result<(), Error> {
 
 fn node_name(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
-    let tree = rcv.tree();
-    let Some(id) = rcv.tree_id() else {
-        return Ok(find_attr(&tree, &rcv.key)
-            .map(|a| a.name.clone())
-            .or_else(|| match &rcv.key {
-                NodeKey::Attr { name, .. } => Some(name.clone()),
-                NodeKey::Tree(_) => None,
-            }));
+    let id = match &rcv.key {
+        NodeKey::Tree(id) => *id,
+        NodeKey::Attr { name, .. } => return Ok(Some(name.clone())),
     };
+    let tree = rcv.tree();
     Ok(match &tree.node(id).kind {
         NodeKind::Element { name, .. } => Some(name.clone()),
         NodeKind::Text { .. } => Some("text".to_owned()),
@@ -617,13 +671,7 @@ fn pointer_id(ruby: &Ruby, rb_self: &NodeObj) -> Result<u64, Error> {
 
 fn parent(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<Value>, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
-    let parent = match &rcv.key {
-        NodeKey::Tree(id) => rcv.tree().parent(*id),
-        NodeKey::Attr { owner, .. } => {
-            (!rcv.state().holders.borrow().contains(owner)).then_some(*owner)
-        }
-    };
-    rcv.wrap_opt(ruby, parent)
+    rcv.wrap_opt(ruby, rcv.parent_id())
 }
 
 fn child_ids(rcv: &Receiver, elements_only: bool) -> Vec<NodeKey> {
@@ -743,11 +791,16 @@ fn blank(ruby: &Ruby, rb_self: &NodeObj) -> Result<bool, Error> {
         return Ok(false);
     };
     Ok(match &rcv.tree().node(id).kind {
-        NodeKind::Text { content } | NodeKind::CData { content } => content
-            .bytes()
-            .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')),
+        NodeKind::Text { content } | NodeKind::CData { content } => {
+            content.bytes().all(is_xml_blank)
+        }
         _ => false,
     })
+}
+
+/// libxml2's `IS_BLANK_CH`: XML whitespace.
+pub fn is_xml_blank(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
 }
 
 /// `Node#[]` (private `get`), like the C version: `prefix:name` looks the
@@ -762,40 +815,35 @@ fn get(ruby: &Ruby, rb_self: &NodeObj, name: Option<String>) -> Result<Option<St
     if !tree.is_element(id) {
         return Ok(None);
     }
-    let found = match name.split_once(':') {
-        Some((prefix, local)) => match namespace::lookup(&tree, id, Some(prefix)) {
+    let found = match namespace::split_qname(&name) {
+        (Some(prefix), local) => match namespace::lookup(&tree, id, Some(prefix)) {
             Some(href) => attributes_of(&tree, id)
                 .find(|a| a.name == local && a.namespace.as_deref() == Some(href.as_str())),
             None => attributes_of(&tree, id).find(|a| a.name == name),
         },
-        None => attributes_of(&tree, id).find(|a| a.name == name && a.namespace.is_none()),
+        (None, _) => attributes_of(&tree, id).find(|a| a.name == name && a.namespace.is_none()),
     };
     Ok(found.map(|a| a.value.clone()))
 }
 
-/// The attribute named `name` in any namespace (libxml2's `xmlHasProp`).
-fn attr_by_name(rcv: &Receiver, name: &str) -> Option<NodeKey> {
+/// The first of the element's attributes that `matches`.
+fn find_attribute(rcv: &Receiver, matches: impl Fn(&Attribute) -> bool) -> Option<NodeKey> {
     let id = rcv.tree_id()?;
     let tree = rcv.tree();
-    if !tree.is_element(id) {
-        return None;
-    }
     attributes_of(&tree, id)
-        .find(|a| a.name == name)
+        .find(|a| matches(a))
         .map(|a| attr_key(id, a))
+}
+
+/// The attribute named `name` in any namespace (libxml2's `xmlHasProp`).
+fn attr_by_name(rcv: &Receiver, name: &str) -> Option<NodeKey> {
+    find_attribute(rcv, |a| a.name == name)
 }
 
 /// The attribute `name` in namespace `ns` (`None`: no namespace), like
 /// libxml2's `xmlHasNsProp`.
 fn attr_by_ns(rcv: &Receiver, name: &str, ns: Option<&str>) -> Option<NodeKey> {
-    let id = rcv.tree_id()?;
-    let tree = rcv.tree();
-    if !tree.is_element(id) {
-        return None;
-    }
-    attributes_of(&tree, id)
-        .find(|a| a.name == name && a.namespace.as_deref() == ns)
-        .map(|a| attr_key(id, a))
+    find_attribute(rcv, |a| a.name == name && a.namespace.as_deref() == ns)
 }
 
 fn has_key(ruby: &Ruby, rb_self: &NodeObj, name: String) -> Result<bool, Error> {
@@ -879,7 +927,7 @@ fn native_write_to(
     Ok(io)
 }
 
-fn escape_attribute(value: &str) -> String {
+pub fn escape_attribute(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
@@ -901,45 +949,11 @@ fn has_data(rb_self: &NodeObj) -> bool {
     rb_self.handle.borrow().is_some()
 }
 
-/// The top of the tree `id` is in: the document node, or the root of a
-/// detached subtree.
-fn tree_top(tree: &Document, id: NodeId) -> NodeId {
-    let mut top = id;
-    while let Some(parent) = tree.parent(top) {
-        top = parent;
-    }
-    top
-}
-
-/// Where a node sorts in document order: its tree, then its position, then
-/// (for attributes, which follow their element) the attribute's index.
-fn order_key(tree: &Document, key: &NodeKey) -> (NodeId, u32, u8, usize) {
-    match key {
-        NodeKey::Tree(id) => (tree_top(tree, *id), tree.document_order_key(*id), 0, 0),
-        NodeKey::Attr {
-            owner,
-            prefix,
-            name,
-        } => {
-            let index = tree
-                .attributes(*owner)
-                .iter()
-                .position(|a| a.prefix == *prefix && a.name == *name)
-                .unwrap_or(usize::MAX);
-            (
-                tree_top(tree, *owner),
-                tree.document_order_key(*owner),
-                1,
-                index,
-            )
-        }
-    }
-}
-
 /// `Node#compare(other)` (private; `Node#<=>`): 1 if this node follows
 /// `other` in document order, -1 if it precedes it, 0 if they are the same
 /// node, and -2 if they are in different trees, as libxml2's
-/// `xmlXPathCmpNodes(other, self)` reports.
+/// `xmlXPathCmpNodes(other, self)` reports. An element's attributes follow
+/// it, in order, before its children.
 fn compare(ruby: &Ruby, rb_self: &NodeObj, other: Value) -> Result<i64, Error> {
     let this = Receiver::of(ruby, rb_self)?;
     let other = Receiver::of_value(ruby, other)?;
@@ -947,39 +961,29 @@ fn compare(ruby: &Ruby, rb_self: &NodeObj, other: Value) -> Result<i64, Error> {
         return Ok(-2);
     }
     let tree = this.tree();
-    let (this_top, this_pos, this_attr, this_index) = order_key(&tree, &this.key);
-    let (other_top, other_pos, other_attr, other_index) = order_key(&tree, &other.key);
-    if this_top != other_top {
-        return Ok(-2);
-    }
-    Ok(
-        match (this_pos, this_attr, this_index).cmp(&(other_pos, other_attr, other_index)) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        },
-    )
+    let attribute_position = |key: &NodeKey| attr_index(&tree, key).map(|(_, index)| index);
+    let order = if this.key.anchor() == other.key.anchor() {
+        attribute_position(&this.key).cmp(&attribute_position(&other.key))
+    } else {
+        match tree.compare_document_order(this.key.anchor(), other.key.anchor()) {
+            Some(order) => order,
+            None => return Ok(-2),
+        }
+    };
+    Ok(order as i64)
 }
 
 /// `Node#lang`: the nearest `xml:lang` on the node or an ancestor.
 fn lang(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
     let tree = rcv.tree();
-    let mut current = Some(match &rcv.key {
-        NodeKey::Tree(id) => *id,
-        NodeKey::Attr { owner, .. } => *owner,
-    });
-    while let Some(id) = current {
-        let found = tree
-            .attributes(id)
+    let lang = tree.ancestors(rcv.key.anchor()).find_map(|id| {
+        tree.attributes(id)
             .iter()
-            .find(|a| a.name == "lang" && a.namespace.as_deref() == Some(namespace::XML_NAMESPACE));
-        if let Some(attribute) = found {
-            return Ok(Some(attribute.value.clone()));
-        }
-        current = tree.parent(id);
-    }
-    Ok(None)
+            .find(|a| a.name == "lang" && a.namespace.as_deref() == Some(namespace::XML_NAMESPACE))
+            .map(|a| a.value.clone())
+    });
+    Ok(lang)
 }
 
 /// Recognises the siblings a path step counts for its `[n]`.
@@ -1070,17 +1074,13 @@ fn path(ruby: &Ruby, rb_self: &NodeObj) -> Result<String, Error> {
     let mut path = String::new();
     let mut current = match &rcv.key {
         NodeKey::Tree(id) => Some(*id),
-        NodeKey::Attr {
-            owner,
-            prefix,
-            name,
-        } => {
+        NodeKey::Attr { prefix, name, .. } => {
             let attribute = find_attr(&tree, &rcv.key);
             path = match (attribute.and_then(|a| a.namespace.as_ref()), prefix) {
                 (Some(_), Some(p)) => format!("/@{p}:{name}"),
                 _ => format!("/@{name}"),
             };
-            (!rcv.state().holders.borrow().contains(owner)).then_some(*owner)
+            rcv.parent_id()
         }
     };
     while let Some(id) = current {
