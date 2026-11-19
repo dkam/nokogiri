@@ -71,7 +71,8 @@ fn clear_aliases(class: RClass) -> RClass {
     class
 }
 
-fn resolve_alias(name: &str) -> Option<String> {
+/// The encoding `name` is an alias for, if it is one.
+pub fn resolve_alias(name: &str) -> Option<String> {
     let key = name.to_ascii_uppercase();
     lock_aliases()
         .iter()

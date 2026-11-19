@@ -4,6 +4,7 @@
 //! Like libxml2's `xmlXPathNodeSetAdd`, it never holds the same object twice.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use magnus::{
     DataTypeFunctions, Error, Module, Object, RArray, Ruby, TypedData, Value, gc, method,
@@ -73,17 +74,23 @@ pub fn members(set: Value) -> Result<Vec<Value>, Error> {
     Ok(Obj::<NodeSetObj>::try_convert(set)?.values(&ruby))
 }
 
-/// A new NodeSet holding `nodes` (deduplicated), with `@document` set and
-/// the document's decorators applied, as `noko_xml_node_set_wrap` does.
+/// The objects' identities, for set operations in linear time.
+fn identities(values: &[Value]) -> HashSet<usize> {
+    values.iter().map(|v| v.as_raw() as usize).collect()
+}
+
+/// A new NodeSet holding `nodes` (deduplicated, keeping first occurrences),
+/// with `@document` set and the document's decorators applied, as
+/// `noko_xml_node_set_wrap` does.
 pub fn new(ruby: &Ruby, document: Value, nodes: Vec<Value>) -> Result<Value, Error> {
-    let mut items: Vec<Value> = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        if !items.iter().any(|v| same(*v, node)) {
-            items.push(node);
-        }
-    }
+    let mut seen = HashSet::with_capacity(nodes.len());
+    let items: Vec<Opaque<Value>> = nodes
+        .into_iter()
+        .filter(|node| seen.insert(node.as_raw() as usize))
+        .map(Into::into)
+        .collect();
     let set = ruby.obj_wrap(NodeSetObj {
-        items: RefCell::new(items.into_iter().map(Into::into).collect()),
+        items: RefCell::new(items),
     });
     set.ivar_set("@document", document)?;
     if !document.is_nil() {
@@ -183,21 +190,21 @@ fn union(ruby: &Ruby, rb_self: Obj<NodeSetObj>, other: Value) -> Result<Value, E
 }
 
 fn intersection(ruby: &Ruby, rb_self: Obj<NodeSetObj>, other: Value) -> Result<Value, Error> {
-    let other = other_set(ruby, other)?;
+    let other = identities(&other_set(ruby, other)?.values(ruby));
     let nodes = rb_self
         .values(ruby)
         .into_iter()
-        .filter(|v| other.contains(ruby, *v))
+        .filter(|v| other.contains(&(v.as_raw() as usize)))
         .collect();
     new(ruby, document_of(rb_self)?, nodes)
 }
 
 fn difference(ruby: &Ruby, rb_self: Obj<NodeSetObj>, other: Value) -> Result<Value, Error> {
-    let other = other_set(ruby, other)?;
+    let other = identities(&other_set(ruby, other)?.values(ruby));
     let nodes = rb_self
         .values(ruby)
         .into_iter()
-        .filter(|v| !other.contains(ruby, *v))
+        .filter(|v| !other.contains(&(v.as_raw() as usize)))
         .collect();
     new(ruby, document_of(rb_self)?, nodes)
 }

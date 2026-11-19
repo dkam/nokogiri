@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use magnus::{
     DataTypeFunctions, Error, Float, Integer, IntoValue, Module, Object, RArray, RClass, RString,
-    Ruby, TypedData, Value, gc, method, prelude::*, rb_sys::AsRawValue, typed_data::Obj,
+    Ruby, TypedData, Value, gc, kwargs, method, prelude::*, rb_sys::AsRawValue, typed_data::Obj,
     value::Opaque,
 };
 use xmloxide::Document;
@@ -48,6 +48,8 @@ impl DataTypeFunctions for XPathContextObj {
 
 pub fn init(ruby: &Ruby) -> Result<(), Error> {
     let class = classes::get(ruby, &classes::XPATH_CONTEXT);
+    // Instances come only from `new`, as in C (`rb_undef_alloc_func`).
+    class.undef_default_alloc_func();
     class.define_singleton_method("new", method!(new, 1))?;
     class.define_method("evaluate", method!(evaluate, -1))?;
     class.define_method("register_ns", method!(register_ns, 2))?;
@@ -293,13 +295,10 @@ impl FunctionResolver for Functions<'_> {
             Ok(false) => return None,
             Err(error) => return Some(Err(self.fail(error))),
         }
-        if namespace.is_none() {
-            self.ruby.warning(&format!(
-                "A custom XPath or CSS handler function named '{name}' is being invoked \
-                 without a namespace. Please update your query to reference this function \
-                 as 'nokogiri:{name}'. Invoking custom handler functions without a namespace \
-                 is deprecated and will become an error in Nokogiri v1.17.0."
-            ));
+        if namespace.is_none()
+            && let Err(error) = self.warn_unnamespaced(name)
+        {
+            return Some(Err(self.fail(error)));
         }
         Some(self.invoke(handler, name, call))
     }
@@ -312,6 +311,26 @@ fn aborted() -> XPathError {
 }
 
 impl Functions<'_> {
+    /// The deprecation warning for a handler function called without a
+    /// namespace. Like C's `rb_category_warning`, it is only issued when
+    /// `$VERBOSE` is true and `Warning[:deprecated]` is enabled, and an
+    /// exception from a `Warning.warn` hook propagates.
+    fn warn_unnamespaced(&self, name: &str) -> Result<(), Error> {
+        let ruby = self.ruby;
+        if !ruby.eval::<Value>("$VERBOSE")?.to_bool() {
+            return Ok(());
+        }
+        let message = format!(
+            "A custom XPath or CSS handler function named '{name}' is being invoked \
+             without a namespace. Please update your query to reference this function \
+             as 'nokogiri:{name}'. Invoking custom handler functions without a namespace \
+             is deprecated and will become an error in Nokogiri v1.17.0."
+        );
+        let options = kwargs!("uplevel" => 0, "category" => ruby.to_symbol("deprecated"));
+        let _: Value = ruby.module_kernel().funcall("warn", (message, options))?;
+        Ok(())
+    }
+
     fn fail(&self, error: Error) -> XPathError {
         self.failure.borrow_mut().get_or_insert(error);
         aborted()

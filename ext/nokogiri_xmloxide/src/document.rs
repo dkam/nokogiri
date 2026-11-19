@@ -5,10 +5,12 @@ use magnus::{
     typed_data::Obj,
 };
 use xmloxide::Document;
+use xmloxide::encoding::EncodingError;
 use xmloxide::error::ParseError;
 use xmloxide::parser::{ParseOptions, parse_str_with_options};
 
 use crate::classes;
+use crate::encoding_handler;
 use crate::node::{DocKind, DocState, NodeObj, Receiver};
 use crate::syntax_error;
 
@@ -66,14 +68,48 @@ fn parser_options(options: i64) -> ParseOptions {
     parse
 }
 
-/// Decodes and parses, the way `xmlReadMemory` does: an explicit `encoding`
-/// overrides detection from the BOM and XML declaration.
+/// Decodes `bytes` to UTF-8, the way `xmlReadMemory` does: an explicit
+/// `encoding` overrides detection from the BOM and XML declaration. Names
+/// registered with `EncodingHandler.alias` resolve to their encodings, both
+/// for `encoding` and in the declaration.
+fn decode(bytes: &[u8], encoding: Option<&str>) -> Result<String, EncodingError> {
+    use xmloxide::encoding::{decode_to_utf8, transcode};
+    if let Some(name) = encoding {
+        let real = encoding_handler::resolve_alias(name);
+        return transcode(bytes, real.as_deref().unwrap_or(name));
+    }
+    decode_to_utf8(bytes).or_else(|failure| {
+        match declared_encoding(bytes).and_then(|d| encoding_handler::resolve_alias(&d)) {
+            Some(real) => transcode(bytes, &real),
+            None => Err(failure),
+        }
+    })
+}
+
+/// The `encoding` named in an ASCII-compatible XML declaration.
+fn declared_encoding(bytes: &[u8]) -> Option<String> {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let head = &bytes[..bytes.len().min(200)];
+    let decl = &head[..head.windows(2).position(|w| w == b"?>")?];
+    if !decl.starts_with(b"<?xml") {
+        return None;
+    }
+    let after = &decl[decl.windows(8).position(|w| w == b"encoding")? + 8..];
+    let after = after
+        .trim_ascii_start()
+        .strip_prefix(b"=")?
+        .trim_ascii_start();
+    let (&quote, rest) = after.split_first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let value = &rest[..rest.iter().position(|&b| b == quote)?];
+    String::from_utf8(value.to_vec()).ok()
+}
+
+/// Decodes and parses.
 fn parse(bytes: &[u8], encoding: Option<&str>, options: i64) -> Result<Document, ParseError> {
-    let decoded = match encoding {
-        Some(name) => xmloxide::encoding::transcode(bytes, name),
-        None => xmloxide::encoding::decode_to_utf8(bytes),
-    };
-    let text = decoded.map_err(|e| ParseError {
+    let text = decode(bytes, encoding).map_err(|e| ParseError {
         message: e.to_string(),
         location: Default::default(),
         diagnostics: Vec::new(),
@@ -85,28 +121,38 @@ fn parse(bytes: &[u8], encoding: Option<&str>, options: i64) -> Result<Document,
     Ok(tree)
 }
 
+/// Parses `input` into a new Ruby document. An `io_error` (a failed
+/// `io.read`) is reported after the parse's own errors, as the fatal error
+/// that stopped it.
 fn read(
     ruby: &Ruby,
     class: RClass,
-    bytes: &[u8],
+    input: &Input,
     url: Option<String>,
     encoding: Option<String>,
     options: i64,
 ) -> Result<Value, Error> {
-    let (tree, errors): (Document, RArray) = match parse(bytes, encoding.as_deref(), options) {
+    let parsed = parse(&input.bytes, encoding.as_deref(), options);
+    let (tree, errors): (Option<Document>, RArray) = match parsed {
         Ok(tree) => {
             let errors = syntax_error::array(ruby, &tree.diagnostics)?;
-            (tree, errors)
+            (Some(tree), errors)
         }
-        Err(failure) => {
-            let errors = syntax_error::array_for_failure(ruby, &failure)?;
+        Err(failure) => (None, syntax_error::array_for_failure(ruby, &failure)?),
+    };
+    if input.io_error {
+        errors.push(syntax_error::io_error(ruby)?)?;
+    }
+    let tree = match tree {
+        Some(tree) if !input.io_error => tree,
+        _ => {
             if options & parse_options::RECOVER == 0 {
                 return Err(syntax_error::raise_aggregate(ruby, errors));
             }
             // libxml2 would return a partial tree here. xmloxide gives up at
             // some errors even in recovery mode (see notes/PLAN.md), so fall
             // back to an empty document that still carries the errors.
-            (Document::new(), errors)
+            tree.unwrap_or_default()
         }
     };
     let document = wrap(ruby, class, tree, url, DocKind::Xml, &[])?;
@@ -124,12 +170,61 @@ fn read_memory(
     options: i64,
 ) -> Result<Value, Error> {
     // Copy the bytes out first: parsing must not hold a borrow of a Ruby string.
-    let bytes = unsafe { input.as_slice() }.to_vec();
-    read(ruby, class, &bytes, url, encoding, options)
+    let input = Input {
+        bytes: unsafe { input.as_slice() }.to_vec(),
+        io_error: false,
+    };
+    read(ruby, class, &input, url, encoding, options)
+}
+
+/// The bytes to parse, and whether reading them stopped on an IO error.
+struct Input {
+    bytes: Vec<u8>,
+    io_error: bool,
+}
+
+/// libxml2's read size for `xmlReadIO` callbacks (`MINLEN` in xmlIO.c).
+const READ_CHUNK: usize = 4000;
+
+/// Reads `io` to the end the way `noko_io_read_protected` feeds libxml2:
+/// `io.read(4000)` until it returns nil or an empty string. A
+/// StandardError from `read`, or a result that isn't a String, is an IO
+/// error that ends the input; any other exception propagates. Like the C
+/// callback, a chunk longer than requested is truncated.
+fn read_all(ruby: &Ruby, io: Value) -> Result<Input, Error> {
+    let mut input = Input {
+        bytes: Vec::new(),
+        io_error: false,
+    };
+    loop {
+        let chunk = match io.funcall::<_, _, Value>("read", (READ_CHUNK,)) {
+            Ok(chunk) => chunk,
+            Err(error) if error.is_kind_of(ruby.exception_standard_error()) => {
+                input.io_error = true;
+                return Ok(input);
+            }
+            Err(error) => return Err(error),
+        };
+        if chunk.is_nil() {
+            return Ok(input);
+        }
+        let Some(chunk) = RString::from_value(chunk) else {
+            input.io_error = true;
+            return Ok(input);
+        };
+        // Copied before any further Ruby call.
+        let bytes = unsafe { chunk.as_slice() };
+        if bytes.is_empty() {
+            return Ok(input);
+        }
+        input
+            .bytes
+            .extend_from_slice(&bytes[..bytes.len().min(READ_CHUNK)]);
+    }
 }
 
 /// `Document.read_io(io, url, encoding, options)`. Reads the whole IO, then
-/// parses; errors raised by `io.read` propagate as they do from C.
+/// parses.
 fn read_io(
     ruby: &Ruby,
     class: RClass,
@@ -138,11 +233,8 @@ fn read_io(
     encoding: Option<String>,
     options: i64,
 ) -> Result<Value, Error> {
-    let content: Option<RString> = io.funcall("read", ())?;
-    let bytes = content
-        .map(|s| unsafe { s.as_slice() }.to_vec())
-        .unwrap_or_default();
-    read(ruby, class, &bytes, url, encoding, options)
+    let input = read_all(ruby, io)?;
+    read(ruby, class, &input, url, encoding, options)
 }
 
 /// `Document.new(version = "1.0", *rest)`

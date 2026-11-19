@@ -139,6 +139,28 @@ pub fn xpath_error(ruby: &Ruby, error: &XPathError, expression: &str) -> Error {
     xpath(ruby, XPathCode::of(error), expression)
 }
 
+/// libxml2's `XML_FROM_IO` error domain.
+const DOMAIN_IO: i64 = 8;
+/// libxml2's `XML_IO_UNKNOWN`.
+const CODE_IO_UNKNOWN: i64 = 1500;
+
+/// The fatal error libxml2 reports when an `xmlReadIO` callback fails.
+pub fn io_error(ruby: &Ruby) -> Result<Value, Error> {
+    build_fields(
+        ruby,
+        &Fields {
+            class: classes::get(ruby, &classes::XML_SYNTAX_ERROR),
+            domain: DOMAIN_IO,
+            code: CODE_IO_UNKNOWN,
+            message: "Unknown IO error\n",
+            level: 3,
+            line: 0,
+            column: 0,
+            str1: None,
+        },
+    )
+}
+
 /// All the diagnostics as a Ruby Array of SyntaxErrors.
 pub fn array(ruby: &Ruby, diagnostics: &[ParseDiagnostic]) -> Result<RArray, Error> {
     let errors = ruby.ary_new();
