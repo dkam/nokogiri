@@ -85,9 +85,15 @@ pub fn wrap(
 }
 
 pub fn parser_options(options: i64) -> ParseOptions {
+    // libxml2 keeps a reference to an external entity it doesn't load, and
+    // loads one only with NOENT.
     let mut parse = ParseOptions::default()
         .recover(options & parse_options::RECOVER != 0)
-        .no_blanks(options & parse_options::NOBLANKS != 0);
+        .no_blanks(options & parse_options::NOBLANKS != 0)
+        .keep_unloaded_entities(true);
+    if options & parse_options::NOENT != 0 {
+        parse = parse.entity_resolver(|request| load_local_entity(request.system_id));
+    }
     if options & parse_options::HUGE != 0 {
         // libxml2's XML_PARSE_HUGE lifts its hard-coded limits.
         parse = parse
@@ -106,6 +112,18 @@ pub(crate) fn html_parser_options(options: i64) -> HtmlParseOptions {
         .no_blanks(options & parse_options::NOBLANKS != 0)
         .no_implied(options & parse_options::NOIMPLIED != 0)
         .no_default_doctype(options & parse_options::NODEFDTD != 0)
+}
+
+/// An external entity's text from a local file, as libxml2 loads it with
+/// NOENT: `system_id` is a path or a `file:` URL. Other URLs aren't loaded,
+/// as Nokogiri parses with NONET by default.
+fn load_local_entity(system_id: &str) -> Option<String> {
+    let path = system_id.strip_prefix("file://").unwrap_or(system_id);
+    if path.contains("://") {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Decodes `bytes` to UTF-8, the way `xmlReadMemory` does: an explicit
