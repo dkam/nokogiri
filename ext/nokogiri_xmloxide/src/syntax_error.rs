@@ -233,3 +233,30 @@ pub fn raise_aggregate(ruby: &Ruby, errors: RArray) -> Error {
         Err(error) => error,
     }
 }
+
+/// Raises what `htmlReadMemory`'s binding raises when a parse without
+/// RECOVER reports anything: a SyntaxError carrying the first error, or a
+/// RuntimeError if the parse failed with none.
+pub fn raise_without_recover(ruby: &Ruby, errors: RArray) -> Error {
+    let Ok(first) = errors.entry::<Value>(0) else {
+        return Error::new(ruby.exception_runtime_error(), "Could not parse document");
+    };
+    if first.is_nil() {
+        return Error::new(ruby.exception_runtime_error(), "Could not parse document");
+    }
+    let message = match first.funcall::<_, _, String>("to_s", ()) {
+        Ok(message) => message,
+        Err(error) => return error,
+    };
+    let class = classes::get(ruby, &classes::XML_SYNTAX_ERROR);
+    match class.new_instance((format!(
+        "Parser without recover option encountered error or warning: {message}"
+    ),))
+    {
+        Ok(exception) => match Exception::from_value(exception) {
+            Some(exception) => exception.into(),
+            None => Error::new(ruby.exception_runtime_error(), message),
+        },
+        Err(error) => error,
+    }
+}

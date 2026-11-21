@@ -27,6 +27,7 @@ mod edit;
 mod encoding_handler;
 mod fragment;
 mod html5;
+mod html_encoding;
 mod namespace;
 mod node;
 mod node_set;

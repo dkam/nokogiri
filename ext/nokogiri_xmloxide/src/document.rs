@@ -1,11 +1,12 @@
 //! `Nokogiri::XML::Document`, mirroring `ext/nokogiri/xml_document.c`.
 
 use magnus::{
-    Error, Module, Object, RArray, RClass, RString, Ruby, Value, method, prelude::*,
+    Error, Exception, Module, Object, RArray, RClass, RString, Ruby, Value, method, prelude::*,
     rb_sys::AsRawValue, typed_data::Obj,
 };
 use xmloxide::encoding::EncodingError;
 use xmloxide::error::ParseError;
+use xmloxide::html::{HtmlParseOptions, parse_html_with_options};
 use xmloxide::parser::{ParseOptions, parse_str_with_options};
 use xmloxide::tree::NodeKind;
 use xmloxide::{Document, NodeId};
@@ -13,6 +14,7 @@ use xmloxide::{Document, NodeId};
 use crate::classes;
 use crate::edit::{CopyLevel, copy_tree_node};
 use crate::encoding_handler;
+use crate::html_encoding;
 use crate::node::{DocKind, DocState, NodeObj, Receiver, document_receiver};
 use crate::syntax_error;
 
@@ -20,7 +22,11 @@ use crate::syntax_error;
 /// backend acts on so far.
 mod parse_options {
     pub const RECOVER: i64 = 1 << 0;
+    /// `HTML_PARSE_NODEFDTD`: no default DOCTYPE for an HTML document without one.
+    pub const NODEFDTD: i64 = 1 << 2;
     pub const NOBLANKS: i64 = 1 << 8;
+    /// `HTML_PARSE_NOIMPLIED`: no implied html, head or body elements.
+    pub const NOIMPLIED: i64 = 1 << 13;
     pub const HUGE: i64 = 1 << 19;
 }
 
@@ -45,6 +51,8 @@ pub fn init(ruby: &Ruby) -> Result<(), Error> {
 
     let html = classes::get(ruby, &classes::HTML4_DOCUMENT);
     html.define_singleton_method("new", method!(html_new, -1))?;
+    html.define_singleton_method("read_memory", method!(html_read_memory, 4))?;
+    html.define_singleton_method("read_io", method!(html_read_io, 4))?;
     html.define_method("type", method!(crate::node::node_type_of, 0))?;
 
     let dtd = classes::get(ruby, &classes::DTD);
@@ -264,6 +272,106 @@ fn version(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
     Ok(match rcv.state().kind {
         DocKind::Xml => Some(version.unwrap_or_else(|| "1.0".to_owned())),
         DocKind::Html => version,
+    })
+}
+
+/// `HTML4::Document.read_memory(string, url, encoding, options)`
+fn html_read_memory(
+    ruby: &Ruby,
+    class: RClass,
+    input: RString,
+    url: Option<String>,
+    encoding: Option<String>,
+    options: i64,
+) -> Result<Value, Error> {
+    // Copied out first, as for XML.
+    let input = Input {
+        bytes: unsafe { input.as_slice() }.to_vec(),
+        io_error: false,
+    };
+    html_read(ruby, class, &input, url, encoding, options)
+}
+
+/// `HTML4::Document.read_io(io, url, encoding, options)`
+fn html_read_io(
+    ruby: &Ruby,
+    class: RClass,
+    io: Value,
+    url: Option<String>,
+    encoding: Option<String>,
+    options: i64,
+) -> Result<Value, Error> {
+    let input = read_all(ruby, io)?;
+    // EncodingReader raises EncodingFound through the IO when it finds a
+    // meta charset, so that the caller can read again knowing it.
+    if io.respond_to("encoding_found", false)? {
+        let found: Value = io.funcall("encoding_found", ())?;
+        if let Some(found) = Exception::from_value(found) {
+            return Err(found.into());
+        }
+    }
+    html_read(ruby, class, &input, url, encoding, options)
+}
+
+/// Parses HTML as `htmlReadMemory` does with libxml2's recovering HTML
+/// parser. Unlike XML, a parse without RECOVER fails on any error at all.
+fn html_read(
+    ruby: &Ruby,
+    class: RClass,
+    input: &Input,
+    url: Option<String>,
+    encoding: Option<String>,
+    options: i64,
+) -> Result<Value, Error> {
+    let decoded = html_encoding::decode(&input.bytes, encoding.as_deref());
+    let html_options = HtmlParseOptions::default()
+        .recover(options & parse_options::RECOVER != 0)
+        .no_blanks(options & parse_options::NOBLANKS != 0)
+        .no_implied(options & parse_options::NOIMPLIED != 0);
+    let errors = ruby.ary_new();
+    for diagnostic in &decoded.diagnostics {
+        errors.push(syntax_error::from_diagnostic(ruby, diagnostic)?)?;
+    }
+    let tree = match parse_html_with_options(&decoded.text, &html_options) {
+        Ok(tree) => {
+            for diagnostic in &tree.diagnostics {
+                errors.push(syntax_error::from_diagnostic(ruby, diagnostic)?)?;
+            }
+            Some(tree)
+        }
+        Err(failure) => {
+            for error in syntax_error::array_for_failure(ruby, &failure)? {
+                errors.push(error)?;
+            }
+            None
+        }
+    };
+    if input.io_error {
+        errors.push(syntax_error::io_error(ruby)?)?;
+    }
+    let mut tree = match tree {
+        Some(tree) if options & parse_options::RECOVER != 0 || errors.is_empty() => tree,
+        _ => return Err(syntax_error::raise_without_recover(ruby, errors)),
+    };
+    tree.encoding = decoded.encoding;
+    if options & parse_options::NODEFDTD == 0 && doctype(&tree).is_none() {
+        let dtd = default_doctype(&mut tree);
+        let document_node = tree.root();
+        tree.prepend_child(document_node, dtd);
+    }
+    let document = wrap(ruby, class, tree, url, DocKind::Html, &[])?;
+    Obj::<NodeObj>::try_convert(document)?.ivar_set("@errors", errors)?;
+    Ok(document)
+}
+
+/// The DOCTYPE `htmlNewDoc` and `htmlParseDocument` give an HTML document
+/// that has none: HTML 4.0 Transitional's.
+fn default_doctype(tree: &mut Document) -> NodeId {
+    tree.create_node(NodeKind::DocumentType {
+        name: "html".to_owned(),
+        public_id: Some("-//W3C//DTD HTML 4.0 Transitional//EN".to_owned()),
+        system_id: Some("http://www.w3.org/TR/REC-html40/loose.dtd".to_owned()),
+        internal_subset: None,
     })
 }
 

@@ -23,6 +23,10 @@ rb-sys = "0.9.130"
 # checkout via [patch] in its .cargo/config.toml.
 xmloxide = { git = "https://github.com/dkam/xmloxide", branch = "nokogiri-backend" }
 
+# Already a dependency of xmloxide; used directly to decode HTML in the
+# encoding a document names.
+encoding_rs = "0.8"
+
 [build-dependencies]
 rb-sys-env = "0.2.3"
 
