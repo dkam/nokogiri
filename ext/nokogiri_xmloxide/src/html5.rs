@@ -17,6 +17,8 @@
 //! - The doctype is the document's first child, as `xmlCreateIntSubset`
 //!   leaves it, with empty identifiers as none.
 
+use std::borrow::Cow;
+
 use magnus::{
     Error, Module, RClass, RHash, RModule, RString, Ruby, Value, function, method,
     prelude::*,
@@ -32,7 +34,7 @@ use xmloxide::{Document, NodeId};
 
 use crate::classes;
 use crate::node::{DocKind, NodeKey, NodeObj, Receiver, find_attr};
-use crate::{document, namespace, syntax_error};
+use crate::{document, edit, namespace, syntax_error};
 
 const XHTML: &str = "http://www.w3.org/1999/xhtml";
 const SVG: &str = "http://www.w3.org/2000/svg";
@@ -147,21 +149,21 @@ fn reshape_element(tree: &mut Document, root: NodeId, id: NodeId) {
         ..
     } = tree.kind_mut(id)
     {
-        let element_prefix = match namespace.as_deref() {
-            Some(SVG) => Some("svg"),
-            Some(MATHML) => Some("math"),
+        let foreign = match namespace.as_deref() {
+            Some(SVG) => Some(("svg", SVG)),
+            Some(MATHML) => Some(("math", MATHML)),
             _ => None,
         };
-        if let Some(p) = element_prefix {
+        if let Some((p, href)) = foreign {
             *prefix = Some(p.to_owned());
-            declare.push((p, if p == "svg" { SVG } else { MATHML }));
+            declare.push((p, href));
         }
         for attribute in attributes.iter_mut() {
             match attribute.namespace.as_deref() {
                 Some(XLINK) => declare.push(("xlink", XLINK)),
                 // An SVG or MathML element's `xmlns` and `xmlns:xlink`, in
                 // the xmlns namespace with that prefix, as gumbo.c puts them.
-                Some(XMLNS) if element_prefix.is_some() => {
+                Some(XMLNS) if foreign.is_some() => {
                     attribute.prefix.get_or_insert_with(|| "xmlns".to_owned());
                     declare.push(("xmlns", XMLNS));
                 }
@@ -185,11 +187,7 @@ fn reshape_element(tree: &mut Document, root: NodeId, id: NodeId) {
 /// Moves the doctype to the front of the document, with empty identifiers
 /// as none.
 fn reshape_doctype(tree: &mut Document) {
-    let document = tree.root();
-    let Some(doctype) = tree
-        .children(document)
-        .find(|id| matches!(tree.node(*id).kind, NodeKind::DocumentType { .. }))
-    else {
+    let Some(doctype) = document::doctype(tree) else {
         return;
     };
     if let NodeKind::DocumentType {
@@ -201,9 +199,10 @@ fn reshape_doctype(tree: &mut Document) {
         public_id.take_if(|id| id.is_empty());
         system_id.take_if(|id| id.is_empty());
     }
-    if let Some(first) = tree.first_child(document).filter(|first| *first != doctype) {
+    let document = tree.root();
+    if tree.first_child(document) != Some(doctype) {
         tree.detach(doctype);
-        tree.insert_before(first, doctype);
+        tree.prepend_child(document, doctype);
     }
 }
 
@@ -259,13 +258,20 @@ fn errors(
 /// next tab stop at a tab, and shows the line as it is in the input.
 struct Positions<'a> {
     input: &'a str,
-    normalized: String,
+    normalized: Cow<'a, str>,
     /// Offsets in `normalized` of the newlines that are CRLF in `input`.
     crlf: Vec<usize>,
 }
 
 impl<'a> Positions<'a> {
     fn new(input: &'a str) -> Self {
+        if !input.contains('\r') {
+            return Self {
+                input,
+                normalized: Cow::Borrowed(input),
+                crlf: Vec::new(),
+            };
+        }
         let mut normalized = String::with_capacity(input.len());
         let mut crlf = Vec::new();
         let mut chars = input.chars().peekable();
@@ -281,7 +287,7 @@ impl<'a> Positions<'a> {
         }
         Self {
             input,
-            normalized,
+            normalized: Cow::Owned(normalized),
             crlf,
         }
     }
@@ -460,8 +466,6 @@ fn parse(ruby: &Ruby, args: &[Value]) -> Result<Value, Error> {
     let document_node = result.document.root();
     reshape(&mut result.document, document_node);
     reshape_doctype(&mut result.document);
-    let errors = errors(ruby, &result, &text, url)?;
-    let quirks_mode = quirks_mode_value(result.quirks_mode);
 
     // The document's own URL, for a String; @url keeps whatever was given,
     // as gumbo.c keeps it.
@@ -472,11 +476,24 @@ fn parse(ruby: &Ruby, args: &[Value]) -> Result<Value, Error> {
     let document = document::wrap(ruby, class, tree, url_string, DocKind::Html, &[])?;
     let object = Obj::<NodeObj>::try_convert(document)?;
     object.ivar_set("@url", url)?;
-    object.ivar_set("@quirks_mode", quirks_mode)?;
-    if let Some(errors) = errors {
+    set_results(ruby, object, &result, &text, url)?;
+    Ok(document)
+}
+
+/// Sets what `gumbo.c` records on a parsed document or fragment: its quirks
+/// mode, and its errors, if it kept any, attributed to `file`.
+fn set_results(
+    ruby: &Ruby,
+    object: Obj<NodeObj>,
+    result: &Html5ParseResult,
+    text: &str,
+    file: Value,
+) -> Result<(), Error> {
+    object.ivar_set("@quirks_mode", quirks_mode_value(result.quirks_mode))?;
+    if let Some(errors) = errors(ruby, result, text, file)? {
         object.ivar_set("@errors", errors)?;
     }
-    Ok(document)
+    Ok(())
 }
 
 /// What `noko_gumbo_s_fragment` works out about the context a fragment is
@@ -484,6 +501,7 @@ fn parse(ruby: &Ruby, args: &[Value]) -> Result<Value, Error> {
 struct FragmentContext {
     /// The context element, in xmloxide's notation (`"svg path"`).
     name: String,
+    namespace: ContextNamespace,
     /// Whether the context is a `form` or has one as an ancestor.
     form: bool,
     /// An `annotation-xml` context's `encoding` attribute.
@@ -492,8 +510,7 @@ struct FragmentContext {
     is_node: bool,
 }
 
-/// A namespace's place in Gumbo's `GumboNamespaceEnum`, for
-/// `lookup_namespace`: `None` for one it doesn't know.
+/// A namespace's place in Gumbo's `GumboNamespaceEnum`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ContextNamespace {
     Html,
@@ -501,57 +518,42 @@ enum ContextNamespace {
     MathMl,
 }
 
-/// `lookup_namespace`: the namespace of `node` (any object answering
-/// `namespace`). An unknown one raises if `required`.
-fn lookup_namespace(
-    ruby: &Ruby,
-    node: Value,
-    required: bool,
-) -> Result<Option<ContextNamespace>, Error> {
+/// The href of `node`'s namespace (any object answering `namespace`).
+fn namespace_href(node: Value) -> Result<Option<String>, Error> {
     let namespace: Value = node.funcall("namespace", ())?;
     if namespace.is_nil() {
-        return Ok(Some(ContextNamespace::Html));
+        return Ok(None);
     }
     let href: RString = namespace.funcall("href", ())?;
-    let href = href.to_string()?;
-    Ok(Some(match href.as_str() {
-        XHTML => ContextNamespace::Html,
-        MATHML => ContextNamespace::MathMl,
-        SVG => ContextNamespace::Svg,
-        _ if required => {
-            return Err(Error::new(
-                ruby.exception_arg_error(),
-                format!("Unexpected namespace URI \"{href}\""),
-            ));
-        }
-        _ => return Ok(None),
-    }))
+    href.to_string().map(Some)
 }
 
-/// A `name` that must be a String, as `Check_Type(…, T_STRING)` requires.
-fn string_name(ruby: &Ruby, node: Value) -> Result<String, Error> {
-    let name: Value = node.funcall("name", ())?;
-    match RString::from_value(name) {
-        Some(name) => name.to_string(),
-        None => Err(Error::new(
-            ruby.exception_type_error(),
-            format!(
-                "wrong argument type {} (expected String)",
-                name.class().inspect()
-            ),
-        )),
+/// `lookup_namespace`: Gumbo's namespace for `href` (none is HTML), or
+/// `None` for one it doesn't know.
+fn lookup_namespace(href: Option<&str>) -> Option<ContextNamespace> {
+    match href {
+        None | Some(XHTML) => Some(ContextNamespace::Html),
+        Some(MATHML) => Some(ContextNamespace::MathMl),
+        Some(SVG) => Some(ContextNamespace::Svg),
+        Some(_) => None,
     }
+}
+
+/// A node's `name`, which must be a String, as `Check_Type` requires.
+fn string_name(ruby: &Ruby, node: Value) -> Result<String, Error> {
+    edit::check_string(ruby, node.funcall("name", ())?)?.to_string()
 }
 
 fn fragment_context(ruby: &Ruby, context: Value) -> Result<FragmentContext, Error> {
-    let tag = |name: String, form: bool| FragmentContext {
-        name,
+    let tag = |namespace: ContextNamespace, name: &str, form: bool| FragmentContext {
+        name: xmloxide_context(namespace, name),
+        namespace,
         form,
         encoding: None,
         is_node: false,
     };
     if context.is_nil() {
-        return Ok(tag("body".to_owned(), false));
+        return Ok(tag(ContextNamespace::Html, "body", false));
     }
     if let Some(name) = RString::from_value(context) {
         let name = name.to_string()?;
@@ -573,11 +575,17 @@ fn fragment_context(ruby: &Ruby, context: Value) -> Result<FragmentContext, Erro
             None => (ContextNamespace::Html, name.as_str()),
         };
         let form = namespace == ContextNamespace::Html && local.eq_ignore_ascii_case("form");
-        return Ok(tag(xmloxide_context(namespace, local), form));
+        return Ok(tag(namespace, local, form));
     }
 
     let name = string_name(ruby, context)?;
-    let namespace = lookup_namespace(ruby, context, true)?.unwrap_or(ContextNamespace::Html);
+    let href = namespace_href(context)?;
+    let Some(namespace) = lookup_namespace(href.as_deref()) else {
+        return Err(Error::new(
+            ruby.exception_arg_error(),
+            format!("Unexpected namespace URI \"{}\"", href.unwrap_or_default()),
+        ));
+    };
     // A form ancestor, or the context itself.
     let mut form = false;
     let mut node = context;
@@ -586,7 +594,8 @@ fn fragment_context(ruby: &Ruby, context: Value) -> Result<FragmentContext, Erro
         if is_element.to_bool() {
             let node_name = string_name(ruby, node)?;
             if node_name.eq_ignore_ascii_case("form")
-                && lookup_namespace(ruby, node, false)? == Some(ContextNamespace::Html)
+                && lookup_namespace(namespace_href(node)?.as_deref())
+                    == Some(ContextNamespace::Html)
             {
                 form = true;
                 break;
@@ -602,7 +611,7 @@ fn fragment_context(ruby: &Ruby, context: Value) -> Result<FragmentContext, Erro
         if namespace == ContextNamespace::MathMl && name.eq_ignore_ascii_case("annotation-xml") {
             let value: Value = context.funcall("[]", ("encoding",))?;
             if value.to_bool() {
-                Some(RString::try_convert(value)?.to_string()?)
+                Some(edit::string(value)?)
             } else {
                 None
             }
@@ -611,6 +620,7 @@ fn fragment_context(ruby: &Ruby, context: Value) -> Result<FragmentContext, Erro
         };
     Ok(FragmentContext {
         name: xmloxide_context(namespace, &name),
+        namespace,
         form,
         encoding,
         is_node: true,
@@ -664,6 +674,7 @@ fn fragment(ruby: &Ruby, args: &[Value]) -> Result<Value, Error> {
     let (rb_fragment, input, context) = args.required;
     let mut options = common_options(args.keywords)?;
     let context = fragment_context(ruby, context)?;
+    let foreign = context.namespace != ContextNamespace::Html;
     let document: Value = rb_fragment.funcall("document", ())?;
     options.fragment_quirks_mode = fragment_quirks_mode(&context, document)?;
     options.fragment_form_ancestor = context.form;
@@ -685,10 +696,6 @@ fn fragment(ruby: &Ruby, args: &[Value]) -> Result<Value, Error> {
     // context, those of the context element under it.
     let parsed = &result.document;
     let html = parsed.root_element();
-    let foreign = options
-        .fragment_context
-        .as_deref()
-        .is_some_and(|c| c.contains(' '));
     let parent = if foreign {
         html.and_then(|h| parsed.first_child(h))
     } else {
@@ -704,13 +711,9 @@ fn fragment(ruby: &Ruby, args: &[Value]) -> Result<Value, Error> {
         }
         reshape(&mut tree, frag_id);
     }
-    let fragment_file = ruby.str_new("#fragment").as_value();
-    let errors = errors(ruby, &result, &text, fragment_file)?;
     let object = Obj::<NodeObj>::try_convert(rb_fragment)?;
-    object.ivar_set("@quirks_mode", quirks_mode_value(result.quirks_mode))?;
-    if let Some(errors) = errors {
-        object.ivar_set("@errors", errors)?;
-    }
+    let fragment_file = ruby.str_new("#fragment").as_value();
+    set_results(ruby, object, &result, &text, fragment_file)?;
     Ok(ruby.qnil().as_value())
 }
 
@@ -757,16 +760,22 @@ fn prepend_newline(ruby: &Ruby, rb_self: &NodeObj) -> Result<bool, Error> {
 }
 
 fn escape(out: &mut String, text: &str, attribute: bool) {
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '\u{a0}' => out.push_str("&nbsp;"),
-            '"' if attribute => out.push_str("&quot;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            c => out.push(c),
-        }
+    // Text between the characters escaped is copied a run at a time.
+    let mut run = 0;
+    for (i, c) in text.char_indices() {
+        let entity = match c {
+            '&' => "&amp;",
+            '\u{a0}' => "&nbsp;",
+            '"' if attribute => "&quot;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            _ => continue,
+        };
+        out.push_str(&text[run..i]);
+        out.push_str(entity);
+        run = i + c.len_utf8();
     }
+    out.push_str(&text[run..]);
 }
 
 /// `output_tagname`: elements in the HTML, SVG and MathML namespaces are
@@ -846,7 +855,7 @@ fn output_node(
                 write_attribute(attribute, out);
             }
             out.push('>');
-            if !is_html_one_of(&tree.node(id).kind, VOID_ELEMENTS) {
+            if !(ns.is_none() && VOID_ELEMENTS.contains(&name.as_str())) {
                 if preserve_newline && should_prepend_newline(tree, id) {
                     out.push('\n');
                 }

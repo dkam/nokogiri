@@ -632,7 +632,7 @@ fn node_name(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
     })
 }
 
-fn node_type_of(ruby: &Ruby, rb_self: &NodeObj) -> Result<i64, Error> {
+pub fn node_type_of(ruby: &Ruby, rb_self: &NodeObj) -> Result<i64, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
     let Some(id) = rcv.tree_id() else {
         return Ok(node_type::ATTRIBUTE);

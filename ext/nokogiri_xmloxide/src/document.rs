@@ -45,7 +45,7 @@ pub fn init(ruby: &Ruby) -> Result<(), Error> {
 
     let html = classes::get(ruby, &classes::HTML4_DOCUMENT);
     html.define_singleton_method("new", method!(html_new, -1))?;
-    html.define_method("type", method!(node_type, 0))?;
+    html.define_method("type", method!(crate::node::node_type_of, 0))?;
 
     let dtd = classes::get(ruby, &classes::DTD);
     dtd.define_method("external_id", method!(dtd_external_id, 0))?;
@@ -297,17 +297,8 @@ fn html_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> 
     wrap(ruby, class, tree, None, DocKind::Html, args)
 }
 
-/// `HTML4::Document#type`: the document's node type.
-fn node_type(ruby: &Ruby, rb_self: &NodeObj) -> Result<i64, Error> {
-    let rcv = Receiver::of(ruby, rb_self)?;
-    Ok(match rcv.state().kind {
-        DocKind::Xml => 9,
-        DocKind::Html => 13,
-    })
-}
-
 /// The document's DOCTYPE node, if it has one (libxml2's `xmlGetIntSubset`).
-fn doctype(tree: &Document) -> Option<NodeId> {
+pub fn doctype(tree: &Document) -> Option<NodeId> {
     tree.children(tree.root())
         .find(|id| matches!(tree.node(*id).kind, NodeKind::DocumentType { .. }))
 }

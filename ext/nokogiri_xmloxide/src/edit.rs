@@ -58,12 +58,26 @@ fn leading<const N: usize>(ruby: &Ruby, args: &[Value]) -> Result<[Value; N], Er
 }
 
 /// `StringValueCStr`: a String (or something with `to_str`).
-fn string(value: Value) -> Result<String, Error> {
+pub fn string(value: Value) -> Result<String, Error> {
     RString::try_convert(value)?.to_string()
 }
 
 fn class_name(value: Value) -> String {
     value.class().inspect()
+}
+
+/// `Check_Type(value, T_STRING)`: `value` if it is a String, or the
+/// TypeError the C extension raises.
+pub fn check_string(ruby: &Ruby, value: Value) -> Result<RString, Error> {
+    RString::from_value(value).ok_or_else(|| {
+        Error::new(
+            ruby.exception_type_error(),
+            format!(
+                "wrong argument type {} (expected String)",
+                class_name(value)
+            ),
+        )
+    })
 }
 
 /// The node a constructor's document argument names. A non-Document node is
@@ -200,15 +214,7 @@ fn cdata_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error>
 /// `Comment.new(document_or_node, content, *rest)`
 fn comment_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
     let [document, content] = leading(ruby, args)?;
-    let Some(content) = RString::from_value(content) else {
-        return Err(Error::new(
-            ruby.exception_type_error(),
-            format!(
-                "wrong argument type {} (expected String)",
-                class_name(content)
-            ),
-        ));
-    };
+    let content = check_string(ruby, content)?;
     if !document.is_kind_of(classes::get(ruby, &classes::NODE)) {
         return Err(Error::new(
             ruby.exception_arg_error(),
@@ -458,17 +464,12 @@ fn set(ruby: &Ruby, rb_self: &NodeObj, name: String, value: Value) -> Result<Val
         Some((prefix, local, href)) => {
             set_attribute(&mut tree, id, Some(prefix), local, Some(&href), &text);
         }
-        // An xmlns attribute set this way is an attribute, not a namespace
-        // declaration (see namespace::is_plain_xmlns).
-        None if name == "xmlns" => set_attribute(
-            &mut tree,
-            id,
-            None,
-            &name,
-            Some(namespace::XMLNS_NAMESPACE),
-            &text,
-        ),
-        None => set_attribute(&mut tree, id, None, &name, None, &text),
+        None => {
+            // An xmlns attribute set this way is an attribute, not a
+            // namespace declaration (see namespace::is_plain_xmlns).
+            let namespace = (name == "xmlns").then_some(namespace::XMLNS_NAMESPACE);
+            set_attribute(&mut tree, id, None, &name, namespace, &text);
+        }
     }
     Ok(value)
 }
