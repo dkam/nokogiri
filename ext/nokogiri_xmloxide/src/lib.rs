@@ -26,6 +26,7 @@ mod document;
 mod edit;
 mod encoding_handler;
 mod fragment;
+mod html5;
 mod namespace;
 mod node;
 mod node_set;
@@ -44,7 +45,7 @@ const IMPERSONATED_LIBXML2_VERSION: &str = "2.14.6";
 const IMPERSONATED_LIBXSLT_VERSION: &str = "1.1.43";
 /// Version of the path-dependency checkout in `../../../xmloxide`.
 /// xmloxide exports no version constant; keep in sync with its Cargo.toml.
-const XMLOXIDE_VERSION: &str = "0.5.0";
+const XMLOXIDE_VERSION: &str = "0.6.0";
 
 #[magnus::init(name = "nokogiri")]
 fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -67,6 +68,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     node_set::init(ruby)?;
     document::init(ruby)?;
     xpath_context::init(ruby)?;
+    html5::init(ruby)?;
 
     Ok(())
 }

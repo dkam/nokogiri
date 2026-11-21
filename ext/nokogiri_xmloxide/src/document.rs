@@ -4,10 +4,11 @@ use magnus::{
     Error, Module, Object, RArray, RClass, RString, Ruby, Value, method, prelude::*,
     rb_sys::AsRawValue, typed_data::Obj,
 };
-use xmloxide::Document;
 use xmloxide::encoding::EncodingError;
 use xmloxide::error::ParseError;
 use xmloxide::parser::{ParseOptions, parse_str_with_options};
+use xmloxide::tree::NodeKind;
+use xmloxide::{Document, NodeId};
 
 use crate::classes;
 use crate::edit::{CopyLevel, copy_tree_node};
@@ -38,6 +39,17 @@ pub fn init(ruby: &Ruby) -> Result<(), Error> {
         "initialize_copy_with_args",
         method!(initialize_copy_with_args, 2),
     )?;
+    let node = classes::get(ruby, &classes::NODE);
+    node.define_method("internal_subset", method!(internal_subset, 0))?;
+    node.define_method("external_subset", method!(external_subset, 0))?;
+
+    let html = classes::get(ruby, &classes::HTML4_DOCUMENT);
+    html.define_singleton_method("new", method!(html_new, -1))?;
+    html.define_method("type", method!(node_type, 0))?;
+
+    let dtd = classes::get(ruby, &classes::DTD);
+    dtd.define_method("external_id", method!(dtd_external_id, 0))?;
+    dtd.define_method("system_id", method!(dtd_system_id, 0))?;
     Ok(())
 }
 
@@ -244,15 +256,102 @@ fn encoding(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
     Ok(Receiver::of(ruby, rb_self)?.tree().encoding.clone())
 }
 
-/// libxml2 always records a version, defaulting to "1.0".
-fn version(ruby: &Ruby, rb_self: &NodeObj) -> Result<String, Error> {
+/// libxml2 records a version for every XML document, defaulting to "1.0",
+/// and none for HTML documents.
+fn version(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
-    let version = rcv
-        .tree()
-        .version
-        .clone()
-        .unwrap_or_else(|| "1.0".to_owned());
-    Ok(version)
+    let version = rcv.tree().version.clone();
+    Ok(match rcv.state().kind {
+        DocKind::Xml => Some(version.unwrap_or_else(|| "1.0".to_owned())),
+        DocKind::Html => version,
+    })
+}
+
+/// `HTML4::Document.new(uri = nil, external_id = nil, *rest)`, as
+/// `htmlNewDoc` makes it: an empty HTML document whose internal subset is
+/// `html` with the given identifiers, or HTML 4.0 Transitional's if neither
+/// is given.
+fn html_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> {
+    let string_at = |index: usize| -> Result<Option<String>, Error> {
+        match args.get(index) {
+            Some(value) if value.to_bool() => Ok(Some(RString::try_convert(*value)?.to_string()?)),
+            _ => Ok(None),
+        }
+    };
+    let (system_id, public_id) = match (string_at(0)?, string_at(1)?) {
+        (None, None) => (
+            Some("http://www.w3.org/TR/REC-html40/loose.dtd".to_owned()),
+            Some("-//W3C//DTD HTML 4.0 Transitional//EN".to_owned()),
+        ),
+        ids => ids,
+    };
+    let mut tree = Document::new();
+    let doctype = tree.create_node(NodeKind::DocumentType {
+        name: "html".to_owned(),
+        public_id,
+        system_id,
+        internal_subset: None,
+    });
+    let document_node = tree.root();
+    tree.append_child(document_node, doctype);
+    wrap(ruby, class, tree, None, DocKind::Html, args)
+}
+
+/// `HTML4::Document#type`: the document's node type.
+fn node_type(ruby: &Ruby, rb_self: &NodeObj) -> Result<i64, Error> {
+    let rcv = Receiver::of(ruby, rb_self)?;
+    Ok(match rcv.state().kind {
+        DocKind::Xml => 9,
+        DocKind::Html => 13,
+    })
+}
+
+/// The document's DOCTYPE node, if it has one (libxml2's `xmlGetIntSubset`).
+fn doctype(tree: &Document) -> Option<NodeId> {
+    tree.children(tree.root())
+        .find(|id| matches!(tree.node(*id).kind, NodeKind::DocumentType { .. }))
+}
+
+/// `Node#internal_subset`: the document's DTD node, or nil.
+fn internal_subset(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<Value>, Error> {
+    let rcv = Receiver::of(ruby, rb_self)?;
+    let id = doctype(&rcv.tree());
+    rcv.wrap_opt(ruby, id)
+}
+
+/// `Node#external_subset`: xmloxide doesn't load external subsets.
+fn external_subset(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<Value>, Error> {
+    Receiver::of(ruby, rb_self)?;
+    Ok(None)
+}
+
+/// One of a DTD node's identifiers.
+fn dtd_id(
+    ruby: &Ruby,
+    rb_self: &NodeObj,
+    pick: fn(&NodeKind) -> Option<&String>,
+) -> Result<Option<String>, Error> {
+    let rcv = Receiver::of(ruby, rb_self)?;
+    let tree = rcv.tree();
+    Ok(rcv
+        .tree_id()
+        .and_then(|id| pick(&tree.node(id).kind).cloned()))
+}
+
+/// `DTD#external_id`: the public identifier.
+fn dtd_external_id(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
+    dtd_id(ruby, rb_self, |kind| match kind {
+        NodeKind::DocumentType { public_id, .. } => public_id.as_ref(),
+        _ => None,
+    })
+}
+
+/// `DTD#system_id`.
+fn dtd_system_id(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {
+    dtd_id(ruby, rb_self, |kind| match kind {
+        NodeKind::DocumentType { system_id, .. } => system_id.as_ref(),
+        _ => None,
+    })
 }
 
 fn url(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<String>, Error> {

@@ -43,8 +43,13 @@ impl DataTypeFunctions for NamespaceObj {}
 // --- Declarations in the tree ---------------------------------------------
 
 /// The prefix (`None` for the default namespace) and URI that `attr`
-/// declares, if it is an `xmlns` or `xmlns:p` attribute.
+/// declares, if it is an `xmlns` or `xmlns:p` attribute. An `xmlns`
+/// attribute that is itself in a namespace (the xmlns namespace, as the
+/// HTML5 parser puts it) is an ordinary attribute.
 pub fn declaration(attr: &Attribute) -> Option<(Option<&str>, &str)> {
+    if attr.namespace.is_some() {
+        return None;
+    }
     match attr.prefix.as_deref() {
         None if attr.name == "xmlns" => Some((None, &attr.value)),
         Some("xmlns") => Some((Some(&attr.name), &attr.value)),
@@ -142,7 +147,7 @@ fn declaration_attribute(prefix: Option<&str>, href: &str) -> Attribute {
 
 /// Declares `prefix` as `href` on element `id`, after its other
 /// declarations and before its attributes, the order libxml2 writes them in.
-fn declare(tree: &mut Document, id: NodeId, prefix: Option<&str>, href: &str) {
+pub fn declare(tree: &mut Document, id: NodeId, prefix: Option<&str>, href: &str) {
     if let NodeKind::Element { attributes, .. } = tree.kind_mut(id) {
         let position = attributes
             .iter()

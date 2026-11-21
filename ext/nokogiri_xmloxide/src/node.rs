@@ -86,7 +86,6 @@ struct Handle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocKind {
     Xml,
-    #[allow(dead_code)] // HTML documents arrive with HTML4 / HTML5 parsing.
     Html,
 }
 

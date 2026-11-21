@@ -9,6 +9,34 @@ use crate::classes;
 
 /// libxml2's `XML_FROM_PARSER` error domain.
 const DOMAIN_PARSER: i64 = 1;
+/// A parse error as `add_errors` in `gumbo.c` reports it: the `code` in
+/// `str1`, the URL (or `"#fragment"`) in `file`.
+pub fn gumbo(
+    ruby: &Ruby,
+    message: &str,
+    code: &str,
+    line: u32,
+    column: u32,
+    file: Value,
+) -> Result<Value, Error> {
+    let error = build_fields(
+        ruby,
+        &Fields {
+            class: classes::get(ruby, &classes::XML_SYNTAX_ERROR),
+            domain: DOMAIN_PARSER,
+            // XML_ERR_INTERNAL_ERROR, as gumbo.c sets it.
+            code: 1,
+            message,
+            level: LEVEL_ERROR,
+            line,
+            column,
+            str1: Some(code),
+        },
+    )?;
+    RObject::try_convert(error)?.ivar_set("@file", file)?;
+    Ok(error)
+}
+
 /// libxml2's `XML_FROM_XPATH` error domain.
 const DOMAIN_XPATH: i64 = 12;
 /// libxml2's `XML_ERR_ERROR` level.
