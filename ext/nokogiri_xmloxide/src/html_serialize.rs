@@ -7,7 +7,7 @@ use xmloxide::tree::{Attribute, NodeKind};
 use xmloxide::{Document, NodeId};
 
 use crate::document::doctype;
-use crate::encoding_handler;
+use crate::html_encoding::Codec;
 use crate::html4_tables::{self, ElementInfo};
 use crate::namespace;
 
@@ -24,6 +24,13 @@ pub fn serialize(
     encoding: Option<&str>,
     format: bool,
 ) -> Vec<u8> {
+    // libxml2 can't open a save context in an encoding it doesn't know, so
+    // writes nothing and leaves the document as it is.
+    if encoding
+        .is_some_and(|name| !name.eq_ignore_ascii_case("html") && Codec::named(name).is_none())
+    {
+        return Vec::new();
+    }
     let named = encoding
         .map(str::to_owned)
         .or_else(|| tree.encoding.clone());
@@ -122,9 +129,10 @@ impl Writer<'_> {
                 out.push_str(name);
                 out.push(';');
             }
-            // libxml2's HTML serializer writes none of these.
-            NodeKind::CData { .. } | NodeKind::DocumentType { .. } | NodeKind::DocumentFragment => {
-            }
+            // HTML_PRESERVE_NODE: as it is, unescaped.
+            NodeKind::CData { content } => out.push_str(content),
+            // libxml2's HTML serializer writes neither of these.
+            NodeKind::DocumentType { .. } | NodeKind::DocumentFragment => {}
         }
     }
 
@@ -174,13 +182,16 @@ impl Writer<'_> {
         }
 
         let block = |info: Option<&ElementInfo>| info.is_some_and(|info| info.inline == 0);
-        let Some(first) = tree.first_child(id) else {
-            // A void element, or one whose end tag may be left out (except
-            // html and body), ends at its start tag.
-            if info.is_some_and(|info| {
-                info.empty != 0
-                    || (info.save_end_tag != 0 && info.name != "html" && info.name != "body")
-            }) {
+        let void = info.is_some_and(|info| info.empty != 0);
+        let Some(first) = tree.first_child(id).filter(|_| !void) else {
+            // A void element ends at its start tag, leaving out any children,
+            // as does an empty one whose end tag may be left out (except html
+            // and body).
+            if void
+                || info.is_some_and(|info| {
+                    info.save_end_tag != 0 && info.name != "html" && info.name != "body"
+                })
+            {
                 out.push('>');
             } else {
                 out.push_str("></");
@@ -262,10 +273,11 @@ impl Writer<'_> {
         out.push('=');
         let is_uri = in_no_namespace
             && element_in_no_namespace
-            && ["href", "action", "src"]
+            && (["href", "action", "src"]
                 .iter()
                 .any(|uri| attribute.name.eq_ignore_ascii_case(uri))
-            || (attribute.name.eq_ignore_ascii_case("name") && element.eq_ignore_ascii_case("a"));
+                || (attribute.name.eq_ignore_ascii_case("name")
+                    && element.eq_ignore_ascii_case("a")));
         if is_uri {
             let trimmed = value.trim_start_matches([' ', '\t', '\n', '\r']);
             write_quoted(&uri_escape(trimmed), out);
@@ -564,27 +576,8 @@ fn encode(text: &str, encoding: &str) -> Vec<u8> {
         }
         return out.into_bytes();
     }
-    let real = encoding_handler::resolve_alias(encoding);
-    let label = real.as_deref().unwrap_or(encoding).trim();
-    if ["ISO-8859-1", "ISO8859-1", "ISO_8859-1", "LATIN1", "L1"]
-        .iter()
-        .any(|name| label.eq_ignore_ascii_case(name))
-    {
-        let mut out = Vec::with_capacity(text.len());
-        for c in text.chars() {
-            match u8::try_from(u32::from(c)) {
-                Ok(byte) => out.push(byte),
-                Err(_) => out.extend_from_slice(format!("&#{};", u32::from(c)).as_bytes()),
-            }
-        }
-        return out;
-    }
-    match encoding_rs::Encoding::for_label(label.as_bytes()) {
-        // encoding_rs writes unmappable characters as decimal references,
-        // as libxml2 does.
-        Some(encoding) if encoding != encoding_rs::UTF_8 => encoding.encode(text).0.into_owned(),
-        _ => text.as_bytes().to_vec(),
-    }
+    // libxml2 writes nothing in an encoding it doesn't know.
+    Codec::named(encoding).map_or_else(Vec::new, |codec| codec.encode(text))
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use magnus::{
     rb_sys::AsRawValue, typed_data::Obj,
 };
 use xmloxide::encoding::EncodingError;
-use xmloxide::error::ParseError;
+use xmloxide::error::{ErrorSeverity, ParseDiagnostic, ParseError};
 use xmloxide::html::{HtmlParseOptions, parse_html_with_options};
 use xmloxide::parser::{ParseOptions, parse_str_with_options};
 use xmloxide::tree::{Attribute, NodeKind};
@@ -15,6 +15,7 @@ use crate::classes;
 use crate::edit::{CopyLevel, copy_tree_node};
 use crate::encoding_handler;
 use crate::html_encoding;
+use crate::html4_tables;
 use crate::namespace;
 use crate::node::{DocKind, DocState, NodeObj, Receiver, document_receiver};
 use crate::syntax_error;
@@ -336,8 +337,8 @@ fn html_read(
     }
     let tree = match parse_html_with_options(&decoded.text, &html_options) {
         Ok(tree) => {
-            for diagnostic in &tree.diagnostics {
-                errors.push(syntax_error::from_diagnostic(ruby, diagnostic)?)?;
+            for diagnostic in tree.diagnostics.iter().filter_map(libxml2_html_diagnostic) {
+                errors.push(syntax_error::from_diagnostic(ruby, &diagnostic)?)?;
             }
             Some(tree)
         }
@@ -365,6 +366,37 @@ fn html_read(
     let document = wrap(ruby, class, tree, url, DocKind::Html, &[])?;
     Obj::<NodeObj>::try_convert(document)?.ivar_set("@errors", errors)?;
     Ok(document)
+}
+
+/// The error libxml2 2.14 reports for one of `xmloxide::html`'s warnings,
+/// if any. 2.14 has no warnings, and of its few errors these are the ones
+/// xmloxide's parser comes across: an end tag that closes nothing, and one
+/// that closes an element whose own end tag mustn't be left out (`b`, `font`
+/// and the like; table `end_tag` 3), which `htmlAutoCloseOnClose` reports.
+/// A 2.14 mode in `xmloxide::html` would report these itself.
+fn libxml2_html_diagnostic(diagnostic: &ParseDiagnostic) -> Option<ParseDiagnostic> {
+    if diagnostic.severity != ErrorSeverity::Warning {
+        return Some(diagnostic.clone());
+    }
+    let message = &diagnostic.message;
+    let enclosed = |prefix: &str, suffix: &str| message.strip_prefix(prefix)?.strip_suffix(suffix);
+    let message = if let Some(name) = enclosed("stray end tag </", ">")
+        .or_else(|| enclosed("end tag for void element </", "> ignored"))
+    {
+        format!("Unexpected end tag : {name}")
+    } else if let Some((closed, end)) =
+        enclosed("implicitly closing <", ">").and_then(|tags| tags.split_once("> before </"))
+    {
+        html4_tables::lookup(closed).filter(|info| info.end_tag == 3)?;
+        format!("Opening and ending tag mismatch: {end} and {closed}")
+    } else {
+        return None;
+    };
+    Some(ParseDiagnostic {
+        severity: ErrorSeverity::Error,
+        message,
+        location: diagnostic.location,
+    })
 }
 
 /// libxml2's HTML parser has no namespaces, so an `xmlns` attribute is an

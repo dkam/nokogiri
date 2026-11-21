@@ -22,6 +22,18 @@ pub struct ElementInfo {
     /// 0 for a block element; inline otherwise.
     pub inline: u8,
     pub description: &'static str,
+    /// How the tokenizer reads the element's content.
+    pub data_mode: DataMode,
+}
+
+/// libxml2's `htmlElemDesc.dataMode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DataMode {
+    Normal,
+    RcData,
+    RawText,
+    Script,
+    PlainText,
 }
 
 /// libxml2's `htmlTagLookup`: the entry for `name`, ignoring ASCII case.
@@ -53,7 +65,7 @@ pub fn entity_for(value: u32) -> Option<&'static str> {
         .map(|entity| entity.1)
 }
 
-static ELEMENTS: [ElementInfo; 90] = [
+static ELEMENTS: [ElementInfo; 95] = [
     ElementInfo {
         name: "a",
         start_tag: 0,
@@ -63,6 +75,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "anchor ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "abbr",
@@ -73,6 +86,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "abbreviated form",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "acronym",
@@ -83,6 +97,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "address",
@@ -93,6 +108,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "information on author ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "applet",
@@ -103,6 +119,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 1,
         inline: 2,
         description: "java applet ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "area",
@@ -113,6 +130,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "client-side image map area ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "b",
@@ -123,6 +141,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "bold text style",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "base",
@@ -133,6 +152,18 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "document base uri ",
+        data_mode: DataMode::Normal,
+    },
+    ElementInfo {
+        name: "basefont",
+        start_tag: 0,
+        end_tag: 2,
+        save_end_tag: 2,
+        empty: 1,
+        deprecated: 1,
+        inline: 1,
+        description: "base font size ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "bdo",
@@ -143,6 +174,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "i18n bidi over-ride ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "big",
@@ -153,6 +185,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "large text style",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "blockquote",
@@ -163,6 +196,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "long quotation ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "body",
@@ -173,6 +207,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "document body ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "br",
@@ -183,6 +218,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "forced line break ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "button",
@@ -193,6 +229,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 2,
         description: "push button ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "caption",
@@ -203,6 +240,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "table caption ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "center",
@@ -213,6 +251,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 1,
         inline: 0,
         description: "shorthand for div align=center ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "cite",
@@ -223,6 +262,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "citation",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "code",
@@ -233,6 +273,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "computer code fragment",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "col",
@@ -243,6 +284,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "table column ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "colgroup",
@@ -253,6 +295,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "table column group ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "dd",
@@ -263,6 +306,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "definition description ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "del",
@@ -273,6 +317,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 2,
         description: "deleted text ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "dfn",
@@ -283,6 +328,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "instance definition",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "dir",
@@ -293,6 +339,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 1,
         inline: 0,
         description: "directory list",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "div",
@@ -303,6 +350,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "generic language/style container",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "dl",
@@ -313,6 +361,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "definition list ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "dt",
@@ -323,6 +372,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "definition term ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "em",
@@ -333,6 +383,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "emphasis",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "embed",
@@ -343,6 +394,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 1,
         inline: 1,
         description: "generic embedded object ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "fieldset",
@@ -353,6 +405,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "form control group ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "font",
@@ -363,6 +416,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 1,
         inline: 1,
         description: "local change to font ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "form",
@@ -373,6 +427,29 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "interactive form ",
+        data_mode: DataMode::Normal,
+    },
+    ElementInfo {
+        name: "frame",
+        start_tag: 0,
+        end_tag: 2,
+        save_end_tag: 2,
+        empty: 1,
+        deprecated: 0,
+        inline: 0,
+        description: "subwindow ",
+        data_mode: DataMode::Normal,
+    },
+    ElementInfo {
+        name: "frameset",
+        start_tag: 0,
+        end_tag: 0,
+        save_end_tag: 0,
+        empty: 0,
+        deprecated: 0,
+        inline: 0,
+        description: "window subdivision",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "h1",
@@ -383,6 +460,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "heading ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "h2",
@@ -393,6 +471,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "heading ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "h3",
@@ -403,6 +482,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "heading ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "h4",
@@ -413,6 +493,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "heading ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "h5",
@@ -423,6 +504,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "heading ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "h6",
@@ -433,6 +515,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "heading ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "head",
@@ -443,6 +526,18 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "document head ",
+        data_mode: DataMode::Normal,
+    },
+    ElementInfo {
+        name: "hr",
+        start_tag: 0,
+        end_tag: 2,
+        save_end_tag: 2,
+        empty: 1,
+        deprecated: 0,
+        inline: 0,
+        description: "horizontal rule ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "html",
@@ -453,6 +548,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "document root element ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "i",
@@ -463,6 +559,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "italic text style",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "iframe",
@@ -473,6 +570,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 2,
         description: "inline subwindow ",
+        data_mode: DataMode::RawText,
     },
     ElementInfo {
         name: "img",
@@ -483,6 +581,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "embedded image ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "input",
@@ -493,6 +592,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "form control ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "ins",
@@ -503,6 +603,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 2,
         description: "inserted text",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "isindex",
@@ -513,6 +614,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 1,
         inline: 0,
         description: "single line prompt ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "kbd",
@@ -523,6 +625,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "text to be entered by the user",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "label",
@@ -533,6 +636,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "form field label text ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "legend",
@@ -543,6 +647,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "fieldset legend ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "li",
@@ -553,6 +658,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "list item ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "link",
@@ -563,6 +669,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "a media-independent link ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "map",
@@ -573,6 +680,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 2,
         description: "client-side image map ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "menu",
@@ -583,6 +691,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 1,
         inline: 0,
         description: "menu list ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "meta",
@@ -593,6 +702,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "generic metainformation ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "noembed",
@@ -603,6 +713,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "",
+        data_mode: DataMode::RawText,
     },
     ElementInfo {
         name: "noframes",
@@ -613,6 +724,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "alternate content container for non frame-based rendering ",
+        data_mode: DataMode::RawText,
     },
     ElementInfo {
         name: "noscript",
@@ -623,6 +735,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "alternate content container for non script-based rendering ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "object",
@@ -633,6 +746,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 2,
         description: "generic embedded object ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "ol",
@@ -643,6 +757,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "ordered list ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "optgroup",
@@ -653,6 +768,18 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "option group ",
+        data_mode: DataMode::Normal,
+    },
+    ElementInfo {
+        name: "option",
+        start_tag: 0,
+        end_tag: 1,
+        save_end_tag: 0,
+        empty: 0,
+        deprecated: 0,
+        inline: 0,
+        description: "selectable choice ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "p",
@@ -663,6 +790,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "paragraph ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "param",
@@ -673,6 +801,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "named property value ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "plaintext",
@@ -683,6 +812,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "",
+        data_mode: DataMode::PlainText,
     },
     ElementInfo {
         name: "pre",
@@ -693,6 +823,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "preformatted text ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "q",
@@ -703,6 +834,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "short inline quotation ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "s",
@@ -713,6 +845,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 1,
         inline: 1,
         description: "strike-through text style",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "samp",
@@ -723,6 +856,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "sample program output, scripts, etc.",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "script",
@@ -733,6 +867,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 2,
         description: "script statements ",
+        data_mode: DataMode::Script,
     },
     ElementInfo {
         name: "select",
@@ -743,6 +878,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "option selector ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "small",
@@ -753,6 +889,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "small text style",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "span",
@@ -763,6 +900,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "generic language/style container ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "strike",
@@ -773,6 +911,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 1,
         inline: 1,
         description: "strike-through text",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "strong",
@@ -783,6 +922,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "strong emphasis",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "style",
@@ -793,6 +933,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "style info ",
+        data_mode: DataMode::RawText,
     },
     ElementInfo {
         name: "sub",
@@ -803,6 +944,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "subscript",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "sup",
@@ -813,6 +955,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "superscript ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "table",
@@ -823,6 +966,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "tbody",
@@ -833,6 +977,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "table body ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "td",
@@ -843,6 +988,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "table data cell",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "textarea",
@@ -853,6 +999,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "multi-line text field ",
+        data_mode: DataMode::RcData,
     },
     ElementInfo {
         name: "tfoot",
@@ -863,6 +1010,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "table footer ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "th",
@@ -873,6 +1021,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "table header cell",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "thead",
@@ -883,6 +1032,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "table header ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "title",
@@ -893,6 +1043,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "document title ",
+        data_mode: DataMode::RcData,
     },
     ElementInfo {
         name: "tr",
@@ -903,6 +1054,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "table row ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "tt",
@@ -913,6 +1065,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "teletype or monospaced text style",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "u",
@@ -923,6 +1076,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 1,
         inline: 1,
         description: "underlined text style",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "ul",
@@ -933,6 +1087,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 0,
         description: "unordered list ",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "var",
@@ -943,6 +1098,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "instance of a variable or program argument",
+        data_mode: DataMode::Normal,
     },
     ElementInfo {
         name: "xmp",
@@ -953,6 +1109,7 @@ static ELEMENTS: [ElementInfo; 90] = [
         deprecated: 0,
         inline: 1,
         description: "",
+        data_mode: DataMode::RawText,
     },
 ];
 
