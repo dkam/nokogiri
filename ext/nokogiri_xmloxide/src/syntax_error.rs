@@ -241,6 +241,11 @@ pub fn raise_without_recover(ruby: &Ruby, errors: RArray) -> Error {
     exception_or_runtime_error(ruby, exception)
 }
 
+/// A SyntaxError for `diagnostic`, to raise.
+pub fn raise(ruby: &Ruby, diagnostic: &ParseDiagnostic) -> Error {
+    exception_or_runtime_error(ruby, from_diagnostic(ruby, diagnostic))
+}
+
 /// `exception` as an error to raise; if it is nil, a RuntimeError "Could
 /// not parse document", as the C extension raises when it has nothing
 /// better.

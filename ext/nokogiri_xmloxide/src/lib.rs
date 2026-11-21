@@ -35,6 +35,7 @@ mod namespace;
 mod node;
 mod node_set;
 mod reparent;
+mod sax;
 mod syntax_error;
 mod test_global_handlers;
 mod warnings;
@@ -74,6 +75,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     xpath_context::init(ruby)?;
     html4::init(ruby, modules.html4)?;
     html5::init(ruby)?;
+    sax::init(ruby)?;
 
     Ok(())
 }

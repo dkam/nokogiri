@@ -188,9 +188,9 @@ fn read_memory(
 }
 
 /// The bytes to parse, and whether reading them stopped on an IO error.
-struct Input {
-    bytes: Vec<u8>,
-    io_error: bool,
+pub(crate) struct Input {
+    pub bytes: Vec<u8>,
+    pub io_error: bool,
 }
 
 impl Input {
@@ -212,7 +212,7 @@ const READ_CHUNK: usize = 4000;
 /// StandardError from `read`, or a result that isn't a String, is an IO
 /// error that ends the input; any other exception propagates. Like the C
 /// callback, a chunk longer than requested is truncated.
-fn read_all(ruby: &Ruby, io: Value) -> Result<Input, Error> {
+pub(crate) fn read_all(ruby: &Ruby, io: Value) -> Result<Input, Error> {
     let mut input = Input {
         bytes: Vec::new(),
         io_error: false,
@@ -382,7 +382,7 @@ fn html_read(
 /// and the like; table `end_tag` 3), which `htmlAutoCloseOnClose` reports.
 /// So is a misplaced `<head>`. A 2.14 mode in `xmloxide::html` would report
 /// these itself.
-fn libxml2_html_diagnostic(mut diagnostic: ParseDiagnostic) -> Option<ParseDiagnostic> {
+pub(crate) fn libxml2_html_diagnostic(mut diagnostic: ParseDiagnostic) -> Option<ParseDiagnostic> {
     if diagnostic.severity != ErrorSeverity::Warning {
         return Some(diagnostic);
     }
