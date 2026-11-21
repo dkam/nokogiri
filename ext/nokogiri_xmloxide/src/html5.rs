@@ -10,9 +10,10 @@
 //!   and xmlns attributes `xlink` and `xmlns`, declared on the top element
 //!   of their subtree (the `html` element, for a document), as
 //!   `lookup_or_add_ns` declares them.
-//! - Every other `xmlns` attribute the parser produced is an attribute in the
-//!   xmlns namespace, not a declaration: Gumbo never declares namespaces from
-//!   markup.
+//! - Gumbo never declares namespaces from markup. An SVG or MathML element's
+//!   `xmlns` attributes are in the xmlns namespace, with that prefix; an HTML
+//!   element's `xmlns` attribute is an ordinary attribute (see
+//!   [`namespace::is_plain_xmlns`]).
 //! - The doctype is the document's first child, as `xmlCreateIntSubset`
 //!   leaves it, with empty identifiers as none.
 
@@ -37,7 +38,7 @@ const XHTML: &str = "http://www.w3.org/1999/xhtml";
 const SVG: &str = "http://www.w3.org/2000/svg";
 const MATHML: &str = "http://www.w3.org/1998/Math/MathML";
 const XLINK: &str = "http://www.w3.org/1999/xlink";
-pub const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
+const XMLNS: &str = namespace::XMLNS_NAMESPACE;
 
 pub fn init(ruby: &Ruby) -> Result<(), Error> {
     let gumbo: RModule = ruby.eval("Nokogiri::Gumbo")?;
@@ -54,19 +55,13 @@ pub fn init(ruby: &Ruby) -> Result<(), Error> {
 
 // --- Options -------------------------------------------------------------
 
-/// The keyword options both entry points take (`common_options` in C).
-struct Options {
-    parse: Html5ParseOptions,
-    /// How many errors to keep; `None` keeps them all.
-    max_errors: Option<usize>,
-}
-
 /// A count option: negative means no limit.
 fn limit(value: i64) -> Option<usize> {
     usize::try_from(value).ok()
 }
 
-fn common_options(kwargs: RHash) -> Result<Options, Error> {
+/// The keyword options both entry points take (`common_options` in C).
+fn common_options(kwargs: RHash) -> Result<Html5ParseOptions, Error> {
     let kwargs = get_kwargs::<_, (i64, i64, i64), (Option<Value>,), ()>(
         kwargs,
         &["max_attributes", "max_errors", "max_tree_depth"],
@@ -74,14 +69,13 @@ fn common_options(kwargs: RHash) -> Result<Options, Error> {
     )?;
     let (max_attributes, max_errors, max_tree_depth) = kwargs.required;
     let (noscript_as_text,) = kwargs.optional;
-    Ok(Options {
-        parse: Html5ParseOptions {
-            scripting: noscript_as_text.is_some_and(|v| v.to_bool()),
-            max_attributes: limit(max_attributes),
-            max_tree_depth: limit(max_tree_depth),
-            ..Default::default()
-        },
+    Ok(Html5ParseOptions {
+        scripting: noscript_as_text.is_some_and(|v| v.to_bool()),
+        max_attributes: limit(max_attributes),
+        max_tree_depth: limit(max_tree_depth),
+        // Gumbo records no more than this, so neither does xmloxide.
         max_errors: limit(max_errors),
+        ..Default::default()
     })
 }
 
@@ -165,11 +159,16 @@ fn reshape_element(tree: &mut Document, root: NodeId, id: NodeId) {
         for attribute in attributes.iter_mut() {
             match attribute.namespace.as_deref() {
                 Some(XLINK) => declare.push(("xlink", XLINK)),
-                Some(XMLNS) => declare.push(("xmlns", XMLNS)),
+                // An SVG or MathML element's `xmlns` and `xmlns:xlink`, in
+                // the xmlns namespace with that prefix, as gumbo.c puts them.
+                Some(XMLNS) if element_prefix.is_some() => {
+                    attribute.prefix.get_or_insert_with(|| "xmlns".to_owned());
+                    declare.push(("xmlns", XMLNS));
+                }
                 Some(_) => {}
-                // An HTML element's `xmlns` or `xmlns:…` attribute is an
-                // attribute, not a declaration.
-                None if namespace::declaration(attribute).is_some() => {
+                // An HTML element's `xmlns` attribute is an attribute, not a
+                // declaration.
+                None if attribute.prefix.is_none() && attribute.name == "xmlns" => {
                     attribute.namespace = Some(XMLNS.to_owned());
                 }
                 None => {}
@@ -210,26 +209,25 @@ fn reshape_doctype(tree: &mut Document) {
 
 // --- Errors --------------------------------------------------------------
 
-/// The parse errors as `Nokogiri::XML::SyntaxError`s, as `add_errors` makes
-/// them: at most `max_errors`, each with its code (or `"generic-parser"`) in
-/// `str1` and Gumbo's message, followed by the line with a caret.
+/// The parse errors (xmloxide kept at most `max_errors`) as
+/// `Nokogiri::XML::SyntaxError`s, as `add_errors` makes them: each with its
+/// code (or `"generic-parser"`) in `str1` and Gumbo's message, followed by
+/// the line with a caret.
 fn errors(
     ruby: &Ruby,
     result: &Html5ParseResult,
     input: &str,
-    max_errors: Option<usize>,
     file: Value,
 ) -> Result<Option<magnus::RArray>, Error> {
     let details = &result.error_details;
-    let count = max_errors.map_or(details.len(), |max| max.min(details.len()));
-    if count == 0 {
+    if details.is_empty() {
         return Ok(None);
     }
-    // Positions are in the input with newlines normalized, as xmloxide reads it.
-    let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
-    let array = ruby.ary_new_capa(count);
-    for error in &details[..count] {
+    let positions = Positions::new(input);
+    let array = ruby.ary_new_capa(details.len());
+    for error in details {
         let location = &error.location;
+        let column = positions.column(location.byte_offset);
         let (code, text) = match &error.kind {
             Html5ErrorKind::Code(code) => (*code, tokenizer_message(code).to_owned()),
             Html5ErrorKind::TreeConstruction {
@@ -241,17 +239,72 @@ fn errors(
                 parser_message(token, *before_doctype, open_elements),
             ),
         };
-        let message = caret_diagnostic(&text, &normalized, location.byte_offset, location.column);
+        let offset = positions.original_offset(location.byte_offset);
+        let message = caret_diagnostic(&text, input, offset, column);
         array.push(syntax_error::gumbo(
             ruby,
             &message,
             code,
             location.line,
-            location.column,
+            column,
             file,
         )?)?;
     }
     Ok(Some(array))
+}
+
+/// Error positions as Gumbo reports them. xmloxide locates an error by its
+/// byte offset in the input with newlines normalized (CR and CRLF to LF), as
+/// both parsers read it. Gumbo counts columns in characters, moving to the
+/// next tab stop at a tab, and shows the line as it is in the input.
+struct Positions<'a> {
+    input: &'a str,
+    normalized: String,
+    /// Offsets in `normalized` of the newlines that are CRLF in `input`.
+    crlf: Vec<usize>,
+}
+
+impl<'a> Positions<'a> {
+    fn new(input: &'a str) -> Self {
+        let mut normalized = String::with_capacity(input.len());
+        let mut crlf = Vec::new();
+        let mut chars = input.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\r' {
+                if chars.next_if_eq(&'\n').is_some() {
+                    crlf.push(normalized.len());
+                }
+                normalized.push('\n');
+            } else {
+                normalized.push(c);
+            }
+        }
+        Self {
+            input,
+            normalized,
+            crlf,
+        }
+    }
+
+    /// Gumbo's column at `offset`: from 1, one per character, and a tab to
+    /// the next multiple of `tab_stop`, 8 (`utf8.c`).
+    fn column(&self, offset: usize) -> u32 {
+        let offset = self.normalized.floor_char_boundary(offset);
+        let before = &self.normalized[..offset];
+        let line = &before[before.rfind('\n').map_or(0, |n| n + 1)..];
+        line.chars().fold(1, |column: u32, c| {
+            if c == '\t' {
+                (column / 8 + 1) * 8
+            } else {
+                column.saturating_add(1)
+            }
+        })
+    }
+
+    /// The offset in the input of `offset` in the normalized input.
+    fn original_offset(&self, offset: usize) -> usize {
+        (offset + self.crlf.partition_point(|&n| n < offset)).min(self.input.len())
+    }
 }
 
 /// Gumbo's message for a tree construction error (`handle_parser_error`).
@@ -402,15 +455,19 @@ fn parse(ruby: &Ruby, args: &[Value]) -> Result<Value, Error> {
     let (input, url, class) = args.required;
     let options = common_options(args.keywords)?;
     let text = input_text(input);
-    let mut result = perform_parse(ruby, &options.parse, &text)?;
+    let mut result = perform_parse(ruby, &options, &text)?;
 
     let document_node = result.document.root();
     reshape(&mut result.document, document_node);
     reshape_doctype(&mut result.document);
-    let errors = errors(ruby, &result, &text, options.max_errors, url)?;
+    let errors = errors(ruby, &result, &text, url)?;
     let quirks_mode = quirks_mode_value(result.quirks_mode);
 
-    let url_string = Option::<String>::try_convert(url)?;
+    // The document's own URL, for a String; @url keeps whatever was given,
+    // as gumbo.c keeps it.
+    let url_string = RString::from_value(url)
+        .map(|url| url.to_string())
+        .transpose()?;
     let tree = std::mem::take(&mut result.document);
     let document = document::wrap(ruby, class, tree, url_string, DocKind::Html, &[])?;
     let object = Obj::<NodeObj>::try_convert(document)?;
@@ -560,10 +617,15 @@ fn fragment_context(ruby: &Ruby, context: Value) -> Result<FragmentContext, Erro
     })
 }
 
-/// The context element in xmloxide's notation.
+/// The context element in xmloxide's notation. Gumbo looks the name up
+/// ignoring case (`gumbo_tagn_enum`), but xmloxide compares names exactly:
+/// lower case, but for SVG's camel-case names, of which only foreignObject
+/// (an HTML integration point) changes how a fragment parses.
 fn xmloxide_context(namespace: ContextNamespace, name: &str) -> String {
+    let name = name.to_ascii_lowercase();
     match namespace {
-        ContextNamespace::Html => name.to_owned(),
+        ContextNamespace::Html => name,
+        ContextNamespace::Svg if name == "foreignobject" => "svg foreignObject".to_owned(),
         ContextNamespace::Svg => format!("svg {name}"),
         ContextNamespace::MathMl => format!("math {name}"),
     }
@@ -603,14 +665,14 @@ fn fragment(ruby: &Ruby, args: &[Value]) -> Result<Value, Error> {
     let mut options = common_options(args.keywords)?;
     let context = fragment_context(ruby, context)?;
     let document: Value = rb_fragment.funcall("document", ())?;
-    options.parse.fragment_quirks_mode = fragment_quirks_mode(&context, document)?;
-    options.parse.fragment_form_ancestor = context.form;
-    options.parse.fragment_context_encoding = context.encoding;
-    options.parse.fragment_context = Some(context.name);
+    options.fragment_quirks_mode = fragment_quirks_mode(&context, document)?;
+    options.fragment_form_ancestor = context.form;
+    options.fragment_context_encoding = context.encoding;
+    options.fragment_context = Some(context.name);
     // Gumbo counts the html element the fragment is parsed under.
-    options.parse.max_tree_depth = options.parse.max_tree_depth.map(|d| d.saturating_add(1));
+    options.max_tree_depth = options.max_tree_depth.map(|d| d.saturating_add(1));
     let text = input_text(input);
-    let result = perform_parse(ruby, &options.parse, &text)?;
+    let result = perform_parse(ruby, &options, &text)?;
 
     let frag = Receiver::of_value(ruby, rb_fragment)?;
     let Some(frag_id) = frag.tree_id() else {
@@ -624,7 +686,6 @@ fn fragment(ruby: &Ruby, args: &[Value]) -> Result<Value, Error> {
     let parsed = &result.document;
     let html = parsed.root_element();
     let foreign = options
-        .parse
         .fragment_context
         .as_deref()
         .is_some_and(|c| c.contains(' '));
@@ -644,7 +705,7 @@ fn fragment(ruby: &Ruby, args: &[Value]) -> Result<Value, Error> {
         reshape(&mut tree, frag_id);
     }
     let fragment_file = ruby.str_new("#fragment").as_value();
-    let errors = errors(ruby, &result, &text, options.max_errors, fragment_file)?;
+    let errors = errors(ruby, &result, &text, fragment_file)?;
     let object = Obj::<NodeObj>::try_convert(rb_fragment)?;
     object.ivar_set("@quirks_mode", quirks_mode_value(result.quirks_mode))?;
     if let Some(errors) = errors {
@@ -878,7 +939,45 @@ fn html_standard_serialize(
 
 #[cfg(test)]
 mod tests {
-    use super::caret_diagnostic;
+    use super::{ContextNamespace, Positions, caret_diagnostic, xmloxide_context};
+
+    #[test]
+    fn columns_follow_gumbo_tab_stops() {
+        let positions = Positions::new("x\nab\t\tc<");
+        // a, b, then the tabs to 8 and 16, then c.
+        assert_eq!(positions.column(7), 17);
+        assert_eq!(positions.column(2), 1);
+        assert_eq!(Positions::new("\t<").column(1), 8);
+        assert_eq!(Positions::new("\u{e9}<").column(2), 2);
+    }
+
+    #[test]
+    fn offsets_map_back_to_the_input_as_given() {
+        let input = "a\r\nb\rc\r\nd";
+        let positions = Positions::new(input);
+        assert_eq!(positions.normalized, "a\nb\nc\nd");
+        let original = |offset| &input[positions.original_offset(offset)..];
+        assert_eq!(original(2), "b\rc\r\nd");
+        assert_eq!(original(4), "c\r\nd");
+        assert_eq!(original(6), "d");
+        assert_eq!(
+            caret_diagnostic("m", input, positions.original_offset(4), 1),
+            "m\nb\rc\r\n^\n"
+        );
+    }
+
+    #[test]
+    fn context_names_are_looked_up_ignoring_case() {
+        assert_eq!(xmloxide_context(ContextNamespace::Html, "TABLE"), "table");
+        assert_eq!(
+            xmloxide_context(ContextNamespace::Svg, "FOREIGNOBJECT"),
+            "svg foreignObject"
+        );
+        assert_eq!(
+            xmloxide_context(ContextNamespace::MathMl, "Annotation-XML"),
+            "math annotation-xml"
+        );
+    }
 
     #[test]
     fn caret_points_at_the_column() {

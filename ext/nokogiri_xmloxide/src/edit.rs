@@ -458,6 +458,16 @@ fn set(ruby: &Ruby, rb_self: &NodeObj, name: String, value: Value) -> Result<Val
         Some((prefix, local, href)) => {
             set_attribute(&mut tree, id, Some(prefix), local, Some(&href), &text);
         }
+        // An xmlns attribute set this way is an attribute, not a namespace
+        // declaration (see namespace::is_plain_xmlns).
+        None if name == "xmlns" => set_attribute(
+            &mut tree,
+            id,
+            None,
+            &name,
+            Some(namespace::XMLNS_NAMESPACE),
+            &text,
+        ),
         None => set_attribute(&mut tree, id, None, &name, None, &text),
     }
     Ok(value)

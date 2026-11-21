@@ -19,6 +19,7 @@ use crate::node::{NodeKey, NodeObj, Receiver, edit_attribute, find_attr};
 use crate::node_set;
 
 pub const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+pub const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 
 /// Which declaration a Namespace object stands for.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -54,6 +55,26 @@ pub fn declaration(attr: &Attribute) -> Option<(Option<&str>, &str)> {
         None if attr.name == "xmlns" => Some((None, &attr.value)),
         Some("xmlns") => Some((Some(&attr.name), &attr.value)),
         _ => None,
+    }
+}
+
+/// Whether `attr` is an ordinary attribute named `xmlns`, in no namespace:
+/// one the HTML5 parser put on an HTML element, or one set with `Node#[]=`.
+/// libxml2 keeps such an attribute apart from namespace definitions, which
+/// are attributes here; it is told from them by being in the xmlns namespace
+/// with no prefix, as no declaration or namespaced attribute is.
+pub fn is_plain_xmlns(attr: &Attribute) -> bool {
+    attr.prefix.is_none()
+        && attr.name == "xmlns"
+        && attr.namespace.as_deref() == Some(XMLNS_NAMESPACE)
+}
+
+/// The namespace an attribute is in: none for a plain `xmlns` attribute.
+pub fn attribute_namespace(attr: &Attribute) -> Option<&str> {
+    if is_plain_xmlns(attr) {
+        None
+    } else {
+        attr.namespace.as_deref()
     }
 }
 
@@ -286,9 +307,7 @@ fn namespace(ruby: &Ruby, rb_self: &NodeObj) -> Result<Option<Value>, Error> {
                 _ => None,
             },
             key @ NodeKey::Attr { owner, .. } => find_attr(&tree, key).and_then(|a| {
-                a.namespace
-                    .as_deref()
-                    .map(|href| (*owner, a.prefix.as_deref(), href))
+                attribute_namespace(a).map(|href| (*owner, a.prefix.as_deref(), href))
             }),
         };
         named.map(|(anchor, prefix, href)| {

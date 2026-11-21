@@ -820,7 +820,8 @@ fn get(ruby: &Ruby, rb_self: &NodeObj, name: Option<String>) -> Result<Option<St
                 .find(|a| a.name == local && a.namespace.as_deref() == Some(href.as_str())),
             None => attributes_of(&tree, id).find(|a| a.name == name),
         },
-        (None, _) => attributes_of(&tree, id).find(|a| a.name == name && a.namespace.is_none()),
+        (None, _) => attributes_of(&tree, id)
+            .find(|a| a.name == name && namespace::attribute_namespace(a).is_none()),
     };
     Ok(found.map(|a| a.value.clone()))
 }
@@ -842,7 +843,9 @@ fn attr_by_name(rcv: &Receiver, name: &str) -> Option<NodeKey> {
 /// The attribute `name` in namespace `ns` (`None`: no namespace), like
 /// libxml2's `xmlHasNsProp`.
 fn attr_by_ns(rcv: &Receiver, name: &str, ns: Option<&str>) -> Option<NodeKey> {
-    find_attribute(rcv, |a| a.name == name && a.namespace.as_deref() == ns)
+    find_attribute(rcv, |a| {
+        a.name == name && namespace::attribute_namespace(a) == ns
+    })
 }
 
 fn has_key(ruby: &Ruby, rb_self: &NodeObj, name: String) -> Result<bool, Error> {
