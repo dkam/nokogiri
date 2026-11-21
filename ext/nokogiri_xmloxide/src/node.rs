@@ -27,6 +27,7 @@ use xmloxide::tree::{Attribute, NodeKind};
 use xmloxide::{Document, NodeId};
 
 use crate::classes;
+use crate::html_serialize;
 use crate::namespace::{self, NsKey};
 use crate::node_set;
 
@@ -49,6 +50,9 @@ mod node_type {
 mod save_options {
     pub const FORMAT: i64 = 1;
     pub const NO_DECLARATION: i64 = 2;
+    pub const AS_XHTML: i64 = 16;
+    pub const AS_XML: i64 = 32;
+    pub const AS_HTML: i64 = 64;
 }
 
 /// Which node a Ruby object refers to.
@@ -892,17 +896,44 @@ fn attribute_nodes(ruby: &Ruby, rb_self: &NodeObj) -> Result<RArray, Error> {
     node_set::array_of(ruby, rcv.wrap_all(ruby, keys)?)
 }
 
-/// Serialises the node and writes it to `io`. Not yet honoured: `encoding`
-/// (output is UTF-8), `NO_EMPTY_TAGS`, and the HTML save modes.
+/// Serialises the node and writes it to `io`, as `xmlSaveTree` does: as
+/// HTML for a node of an HTML document (unless `AS_XML`) or with `AS_HTML`,
+/// otherwise as XML. Not yet honoured: `AS_XHTML`, `NO_EMPTY_TAGS`, and
+/// output encodings other than UTF-8 for XML.
 fn native_write_to(
     ruby: &Ruby,
     rb_self: &NodeObj,
     io: Value,
-    _encoding: Option<String>,
+    encoding: Option<String>,
     indent_string: String,
     options: i64,
 ) -> Result<Value, Error> {
     let rcv = Receiver::of(ruby, rb_self)?;
+    let html_document = matches!(rcv.state().kind, DocKind::Html);
+    if options & save_options::AS_XHTML == 0
+        && ((html_document && options & save_options::AS_XML == 0)
+            || options & save_options::AS_HTML != 0)
+    {
+        let target = match &rcv.key {
+            NodeKey::Tree(id) => html_serialize::Target::Node(*id),
+            key @ NodeKey::Attr { owner, .. } => match find_attr(&rcv.tree(), key) {
+                Some(attribute) => html_serialize::Target::Attribute {
+                    owner: *owner,
+                    attribute: attribute.clone(),
+                },
+                None => return Ok(io),
+            },
+        };
+        let bytes = html_serialize::serialize(
+            &mut *rcv.tree_mut(ruby)?,
+            &target,
+            html_document,
+            encoding.as_deref(),
+            options & save_options::FORMAT != 0,
+        );
+        write_bytes(ruby, io, &bytes)?;
+        return Ok(io);
+    }
     let markup = {
         let tree = rcv.tree();
         match &rcv.key {
@@ -927,6 +958,20 @@ fn native_write_to(
     };
     let _: Value = io.funcall("write", (ruby.str_new(&markup),))?;
     Ok(io)
+}
+
+/// Writes `bytes` to `io` as `noko_io_write` does: as a String in the IO's
+/// external encoding, or binary if it has none.
+fn write_bytes(ruby: &Ruby, io: Value, bytes: &[u8]) -> Result<(), Error> {
+    let string = ruby.str_from_slice(bytes);
+    if io.respond_to("external_encoding", false)? {
+        let encoding: Value = io.funcall("external_encoding", ())?;
+        if !encoding.is_nil() {
+            let _: Value = string.funcall("force_encoding", (encoding,))?;
+        }
+    }
+    let _: Value = io.funcall("write", (string,))?;
+    Ok(())
 }
 
 pub fn escape_attribute(value: &str) -> String {

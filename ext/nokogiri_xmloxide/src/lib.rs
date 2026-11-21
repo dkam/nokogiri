@@ -26,8 +26,11 @@ mod document;
 mod edit;
 mod encoding_handler;
 mod fragment;
+mod html4;
+mod html4_tables;
 mod html5;
 mod html_encoding;
+mod html_serialize;
 mod namespace;
 mod node;
 mod node_set;
@@ -69,6 +72,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     node_set::init(ruby)?;
     document::init(ruby)?;
     xpath_context::init(ruby)?;
+    html4::init(ruby, modules.html4)?;
     html5::init(ruby)?;
 
     Ok(())

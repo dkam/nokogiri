@@ -8,13 +8,14 @@ use xmloxide::encoding::EncodingError;
 use xmloxide::error::ParseError;
 use xmloxide::html::{HtmlParseOptions, parse_html_with_options};
 use xmloxide::parser::{ParseOptions, parse_str_with_options};
-use xmloxide::tree::NodeKind;
+use xmloxide::tree::{Attribute, NodeKind};
 use xmloxide::{Document, NodeId};
 
 use crate::classes;
 use crate::edit::{CopyLevel, copy_tree_node};
 use crate::encoding_handler;
 use crate::html_encoding;
+use crate::namespace;
 use crate::node::{DocKind, DocState, NodeObj, Receiver, document_receiver};
 use crate::syntax_error;
 
@@ -327,7 +328,8 @@ fn html_read(
     let html_options = HtmlParseOptions::default()
         .recover(options & parse_options::RECOVER != 0)
         .no_blanks(options & parse_options::NOBLANKS != 0)
-        .no_implied(options & parse_options::NOIMPLIED != 0);
+        .no_implied(options & parse_options::NOIMPLIED != 0)
+        .no_default_doctype(options & parse_options::NODEFDTD != 0);
     let errors = ruby.ary_new();
     for diagnostic in &decoded.diagnostics {
         errors.push(syntax_error::from_diagnostic(ruby, diagnostic)?)?;
@@ -354,6 +356,7 @@ fn html_read(
         _ => return Err(syntax_error::raise_without_recover(ruby, errors)),
     };
     tree.encoding = decoded.encoding;
+    mark_xmlns_attributes(&mut tree);
     if options & parse_options::NODEFDTD == 0 && doctype(&tree).is_none() {
         let dtd = default_doctype(&mut tree);
         let document_node = tree.root();
@@ -362,6 +365,27 @@ fn html_read(
     let document = wrap(ruby, class, tree, url, DocKind::Html, &[])?;
     Obj::<NodeObj>::try_convert(document)?.ivar_set("@errors", errors)?;
     Ok(document)
+}
+
+/// libxml2's HTML parser has no namespaces, so an `xmlns` attribute is an
+/// attribute like any other. xmloxide's keeps it as it keeps a namespace
+/// declaration; it becomes the plain `xmlns` attribute this backend tells
+/// from one (`namespace::is_plain_xmlns`). Attributes such as `xmlns:p` are
+/// already ordinary: their names keep the colon, with no prefix.
+fn mark_xmlns_attributes(tree: &mut Document) {
+    let elements: Vec<NodeId> = tree
+        .descendants(tree.root())
+        .filter(|&id| tree.is_element(id))
+        .collect();
+    for id in elements {
+        if let NodeKind::Element { attributes, .. } = tree.kind_mut(id) {
+            let default_declaration =
+                |a: &Attribute| a.name == "xmlns" && a.prefix.is_none() && a.namespace.is_none();
+            for attribute in attributes.iter_mut().filter(|a| default_declaration(a)) {
+                attribute.namespace = Some(namespace::XMLNS_NAMESPACE.to_owned());
+            }
+        }
+    }
 }
 
 /// The DOCTYPE `htmlNewDoc` and `htmlParseDocument` give an HTML document
