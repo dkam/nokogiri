@@ -436,7 +436,20 @@ impl<'a> Callbacks<'a> {
         }
     }
 
+    /// Keeps track of the open HTML elements, for events reported and for
+    /// those a push parser skips as reported before.
+    fn track(&mut self, event: &Event<'_>) {
+        if self.language == Language::Html {
+            match event {
+                Event::StartElement { name, .. } => self.open.push((*name).to_owned()),
+                Event::EndElement { .. } => drop(self.open.pop()),
+                _ => {}
+            }
+        }
+    }
+
     fn call(&mut self, event: Event<'_>, location: SourceLocation) -> Result<(), Error> {
+        self.track(&event);
         if let Some(error) = &self.input_error {
             let reached = match event {
                 Event::EndDocument => true,
@@ -531,13 +544,9 @@ impl<'a> Callbacks<'a> {
                 for attribute in attributes {
                     pairs.push((attribute.name.as_str(), attribute.value.as_str()))?;
                 }
-                self.open.push(name.to_owned());
                 self.send("start_element", (name, pairs))
             }
-            Event::EndElement { name, .. } => {
-                self.open.pop();
-                self.send("end_element", (name,))
-            }
+            Event::EndElement { name, .. } => self.send("end_element", (name,)),
             Event::Text(text) => {
                 let raw = self
                     .open
@@ -642,6 +651,8 @@ struct PushState {
     options: i64,
     /// How many events have been reported.
     reported: usize,
+    /// Whether a problem with the input has been reported.
+    reported_input_error: bool,
 }
 
 /// `PushParser#initialize_native(sax_parser, filename)`. The writes call
@@ -706,23 +717,31 @@ fn push_write(
     let parser = RObject::try_convert(rb_self.ivar_get::<_, Value>("@sax_parser")?)?;
     let document: Value = parser.ivar_get("@document")?;
 
-    let (language, input, options, reported) = {
-        let state = rb_self.0.borrow();
-        let options = match state.language {
-            Language::Xml => state.options,
-            Language::Html => state.options | RECOVER,
-        };
-        let input = state.input.clone();
-        (state.language, input, options, state.reported)
+    let state = rb_self.0.borrow();
+    let (language, reported) = (state.language, state.reported);
+    let options = match language {
+        Language::Xml => state.options,
+        Language::Html => state.options | RECOVER,
     };
     let recover = options & RECOVER != 0;
-    let (text, input_error) = match language {
-        Language::Xml => decode(&input, None, recover),
-        Language::Html => html_decode(&input, rb_self.0.borrow().encoding.as_deref()),
+    let decode_input = |input: &[u8]| match language {
+        Language::Xml => decode(input, None, recover),
+        Language::Html => html_decode(input, state.encoding.as_deref()),
     };
-    // Before the last chunk, an invalid sequence at the very end may be a
-    // character that the next chunk completes.
-    let input_error = input_error.filter(|error| last || input.len() - error.at >= 4);
+    let (mut text, mut input_error) = decode_input(&state.input);
+    // Before the last chunk, an invalid sequence that leaving out the last
+    // few bytes removes is a character the next chunk may complete.
+    if !last && input_error.is_some() {
+        let input = &state.input;
+        let complete = (1..4.min(input.len()))
+            .map(|k| decode_input(&input[..input.len() - k]))
+            .find(|(_, error)| error.is_none());
+        if let Some(complete) = complete {
+            (text, input_error) = complete;
+        }
+    }
+    let reported_input_error = state.reported_input_error;
+    drop(state);
     // Before the last chunk, only up to the last `>`: what follows it is
     // text or markup that the next chunk may continue. (Where xmloxide
     // reports running out of input in a construct depends on the construct;
@@ -737,6 +756,7 @@ fn push_write(
     let mut callbacks = Callbacks::new(ruby, document, language, &location);
     callbacks.replace_entities = options & NOENT != 0;
     callbacks.input_error = input_error;
+    callbacks.reported_input_error = reported_input_error;
     let mut handler = Push {
         callbacks,
         last,
@@ -746,7 +766,10 @@ fn push_write(
         stopped: false,
     };
     let result = language.parse(text, recover, &mut handler);
-    rb_self.0.borrow_mut().reported = handler.complete.max(reported);
+    let mut state = rb_self.0.borrow_mut();
+    state.reported = handler.complete.max(reported);
+    state.reported_input_error = handler.callbacks.reported_input_error;
+    drop(state);
     if let Some(raised) = handler.callbacks.raised {
         return Err(raised);
     }
@@ -806,6 +829,8 @@ impl EventHandler for Push<'_> {
             self.complete += 1;
             if self.complete > self.skip {
                 self.callbacks.event(event, location);
+            } else {
+                self.callbacks.track(&event);
             }
         }
     }
