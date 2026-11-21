@@ -22,8 +22,10 @@ use crate::syntax_error;
 
 /// Nokogiri's `ParseOptions` bits (libxml2's `xmlParserOption`) that the
 /// backend acts on so far.
-mod parse_options {
+pub(crate) mod parse_options {
     pub const RECOVER: i64 = 1 << 0;
+    /// `XML_PARSE_NOENT`: a SAX parser reports no entity references.
+    pub const NOENT: i64 = 1 << 1;
     /// `HTML_PARSE_NODEFDTD`: no default DOCTYPE for an HTML document without one.
     pub const NODEFDTD: i64 = 1 << 2;
     pub const NOBLANKS: i64 = 1 << 8;
@@ -95,6 +97,15 @@ pub fn parser_options(options: i64) -> ParseOptions {
             .max_name_length(1 << 30);
     }
     parse
+}
+
+/// The HTML parser's options for Nokogiri's `options`.
+pub(crate) fn html_parser_options(options: i64) -> HtmlParseOptions {
+    HtmlParseOptions::default()
+        .recover(options & parse_options::RECOVER != 0)
+        .no_blanks(options & parse_options::NOBLANKS != 0)
+        .no_implied(options & parse_options::NOIMPLIED != 0)
+        .no_default_doctype(options & parse_options::NODEFDTD != 0)
 }
 
 /// Decodes `bytes` to UTF-8, the way `xmlReadMemory` does: an explicit
@@ -196,7 +207,7 @@ pub(crate) struct Input {
 impl Input {
     /// The string's bytes, copied out first: parsing must not hold a borrow
     /// of a Ruby string.
-    fn from_string(string: RString) -> Self {
+    pub(crate) fn from_string(string: RString) -> Self {
         Input {
             bytes: unsafe { string.as_slice() }.to_vec(),
             io_error: false,
@@ -340,18 +351,13 @@ fn html_read(
     encoding: Option<String>,
     options: i64,
 ) -> Result<Value, Error> {
-    let decoded = html_encoding::decode(&input.bytes, encoding.as_deref());
-    let html_options = HtmlParseOptions::default()
-        .recover(options & parse_options::RECOVER != 0)
-        .no_blanks(options & parse_options::NOBLANKS != 0)
-        .no_implied(options & parse_options::NOIMPLIED != 0)
-        .no_default_doctype(options & parse_options::NODEFDTD != 0);
+    let decoded = html_encoding::decode(&input.bytes, encoding.as_deref(), true);
     let errors = syntax_error::array(ruby, &decoded.diagnostics)?;
-    let mut parsed = parse_html_with_options(&decoded.text, &html_options);
+    let mut parsed = parse_html_with_options(&decoded.text, &html_parser_options(options));
     match &mut parsed {
         Ok(tree) => {
             let diagnostics = std::mem::take(&mut tree.diagnostics);
-            for diagnostic in diagnostics.into_iter().filter_map(libxml2_html_diagnostic) {
+            for diagnostic in diagnostics.iter().filter_map(libxml2_html_diagnostic) {
                 errors.push(syntax_error::from_diagnostic(ruby, &diagnostic)?)?;
             }
         }
@@ -382,9 +388,9 @@ fn html_read(
 /// and the like; table `end_tag` 3), which `htmlAutoCloseOnClose` reports.
 /// So is a misplaced `<head>`. A 2.14 mode in `xmloxide::html` would report
 /// these itself.
-pub(crate) fn libxml2_html_diagnostic(mut diagnostic: ParseDiagnostic) -> Option<ParseDiagnostic> {
+pub(crate) fn libxml2_html_diagnostic(diagnostic: &ParseDiagnostic) -> Option<ParseDiagnostic> {
     if diagnostic.severity != ErrorSeverity::Warning {
-        return Some(diagnostic);
+        return Some(diagnostic.clone());
     }
     let message = &diagnostic.message;
     let enclosed = |prefix: &str, suffix: &str| message.strip_prefix(prefix)?.strip_suffix(suffix);
@@ -404,9 +410,11 @@ pub(crate) fn libxml2_html_diagnostic(mut diagnostic: ParseDiagnostic) -> Option
     } else {
         return None;
     };
-    diagnostic.severity = ErrorSeverity::Error;
-    diagnostic.message = message;
-    Some(diagnostic)
+    Some(ParseDiagnostic {
+        severity: ErrorSeverity::Error,
+        message,
+        location: diagnostic.location,
+    })
 }
 
 /// HTML 4.0 Transitional's DOCTYPE identifiers, which `htmlNewDoc` gives a

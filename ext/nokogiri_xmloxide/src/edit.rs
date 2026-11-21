@@ -70,12 +70,20 @@ fn class_name(value: Value) -> String {
 /// TypeError the C extension raises.
 pub fn check_string(ruby: &Ruby, value: Value) -> Result<RString, Error> {
     RString::from_value(value).ok_or_else(|| {
+        // nil, true and false by name, as rb_builtin_class_name gives them.
+        let special = [
+            ruby.class_nil_class(),
+            ruby.class_true_class(),
+            ruby.class_false_class(),
+        ];
+        let type_name = if special.iter().any(|&class| value.is_kind_of(class)) {
+            value.inspect()
+        } else {
+            class_name(value)
+        };
         Error::new(
             ruby.exception_type_error(),
-            format!(
-                "wrong argument type {} (expected String)",
-                class_name(value)
-            ),
+            format!("wrong argument type {type_name} (expected String)"),
         )
     })
 }

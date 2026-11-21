@@ -157,16 +157,18 @@ impl Codec {
 
     /// `bytes` as text, and the offset in the text of the first invalid
     /// sequence, if any: in UTF-8 it becomes U+FFFD, and elsewhere the text
-    /// ends there.
-    pub fn decode(self, bytes: &[u8]) -> (String, Option<usize>) {
+    /// ends there. Unless `last`, a character the end of `bytes` cuts off
+    /// is left out, not invalid: the bytes after may complete it.
+    pub fn decode(self, bytes: &[u8], last: bool) -> (Cow<'_, str>, Option<usize>) {
         let encoding = match self {
             Codec::Utf8 => {
                 return match std::str::from_utf8(bytes) {
-                    Ok(text) => (text.to_owned(), None),
-                    Err(error) => (
-                        String::from_utf8_lossy(bytes).into_owned(),
-                        Some(error.valid_up_to()),
-                    ),
+                    Ok(text) => (Cow::Borrowed(text), None),
+                    Err(error) if !last && error.error_len().is_none() => {
+                        let complete = &bytes[..error.valid_up_to()];
+                        (String::from_utf8_lossy(complete), None)
+                    }
+                    Err(error) => (String::from_utf8_lossy(bytes), Some(error.valid_up_to())),
                 };
             }
             Codec::Latin1 => return (latin1(bytes), None),
@@ -188,10 +190,10 @@ impl Codec {
             .max_utf8_buffer_length_without_replacement(bytes.len())
             .unwrap_or(bytes.len());
         let mut text = String::with_capacity(capacity);
-        let (result, _) = decoder.decode_to_string_without_replacement(bytes, &mut text, true);
+        let (result, _) = decoder.decode_to_string_without_replacement(bytes, &mut text, last);
         let invalid =
             matches!(result, encoding_rs::DecoderResult::Malformed(..)).then_some(text.len());
-        (text, invalid)
+        (Cow::Owned(text), invalid)
     }
 
     /// `text` in this encoding, each character it can't represent as a
@@ -247,6 +249,9 @@ fn lock_aliases() -> std::sync::MutexGuard<'static, Vec<(String, String)>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn latin1(bytes: &[u8]) -> String {
-    encoding_rs::mem::decode_latin1(bytes).into_owned()
+/// libxml2's error for input that is invalid in its encoding.
+pub const INVALID_BYTES: &str = "Invalid bytes in character encoding";
+
+fn latin1(bytes: &[u8]) -> Cow<'_, str> {
+    encoding_rs::mem::decode_latin1(bytes)
 }

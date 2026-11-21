@@ -10,30 +10,35 @@
 //! - Otherwise ISO-8859-1, which libxml2 falls back to at the first
 //!   non-ASCII byte. An all-ASCII document reports no encoding.
 
+use std::borrow::Cow;
+
 use xmloxide::error::{ErrorSeverity, ParseDiagnostic, SourceLocation};
 
 use xmloxide::encoding::detect_encoding;
 
-use crate::encoding_handler::Codec;
+use crate::encoding_handler::{Codec, INVALID_BYTES};
 use crate::html4_tables::{self, DataMode};
 
 /// The input as text, what `Document#encoding` reports, and any problem
 /// decoding it.
-pub struct Decoded {
-    pub text: String,
+pub struct Decoded<'a> {
+    pub text: Cow<'a, str>,
     pub encoding: Option<String>,
     pub diagnostics: Vec<ParseDiagnostic>,
 }
 
-pub fn decode(bytes: &[u8], encoding: Option<&str>) -> Decoded {
+///
+/// Unless `last`, a character the end of `bytes` cuts off is left out: the
+/// bytes after may complete it.
+pub fn decode<'a>(bytes: &'a [u8], encoding: Option<&str>, last: bool) -> Decoded<'a> {
     if let Some(name) = encoding {
-        return named(bytes, name);
+        return named(bytes, name, last);
     }
     let (label, bom) = detect_encoding(bytes);
     if bom > 0 {
         return Decoded {
             encoding: None,
-            ..named(bytes, label)
+            ..named(bytes, label, last)
         };
     }
     let ascii = bytes
@@ -41,10 +46,10 @@ pub fn decode(bytes: &[u8], encoding: Option<&str>) -> Decoded {
         .position(|b| !b.is_ascii())
         .unwrap_or(bytes.len());
     if let Some(charset) = meta_charset(&bytes[..ascii]) {
-        return named(bytes, &charset);
+        return named(bytes, &charset, last);
     }
     Decoded {
-        text: Codec::Latin1.decode(bytes).0,
+        text: Codec::Latin1.decode(bytes, last).0,
         encoding: (ascii < bytes.len()).then(|| "ISO-8859-1".to_owned()),
         diagnostics: Vec::new(),
     }
@@ -54,10 +59,10 @@ pub fn decode(bytes: &[u8], encoding: Option<&str>) -> Decoded {
 /// reports, after a byte order mark of that encoding, which
 /// `xmlSwitchInputEncoding` skips. In UTF-8 an invalid sequence is an error
 /// and becomes U+FFFD; in any other encoding the input ends there.
-fn named(bytes: &[u8], name: &str) -> Decoded {
+fn named<'a>(bytes: &'a [u8], name: &str, last: bool) -> Decoded<'a> {
     let Some(codec) = Codec::named(name) else {
         return Decoded {
-            text: Codec::Latin1.decode(bytes).0,
+            text: Codec::Latin1.decode(bytes, last).0,
             encoding: Some("ISO-8859-1".to_owned()),
             diagnostics: vec![diagnostic(
                 ErrorSeverity::Warning,
@@ -70,19 +75,13 @@ fn named(bytes: &[u8], name: &str) -> Decoded {
         .bom()
         .and_then(|bom| bytes.strip_prefix(bom))
         .unwrap_or(bytes);
-    let (text, invalid) = codec.decode(bytes);
+    let (text, invalid) = codec.decode(bytes, last);
     let severity = match codec {
         Codec::Utf8 => ErrorSeverity::Error,
         _ => ErrorSeverity::Fatal,
     };
     let diagnostics = invalid
-        .map(|at| {
-            diagnostic(
-                severity,
-                "Invalid bytes in character encoding".to_owned(),
-                location(&text, at),
-            )
-        })
+        .map(|at| diagnostic(severity, INVALID_BYTES.to_owned(), location(&text, at)))
         .into_iter()
         .collect();
     Decoded {
@@ -280,19 +279,19 @@ mod tests {
 
     #[test]
     fn undeclared_non_ascii_is_latin1() {
-        let decoded = decode(b"<p>caf\xC3\xA9", None);
+        let decoded = decode(b"<p>caf\xC3\xA9", None, true);
         assert_eq!(decoded.text, "<p>caf\u{C3}\u{A9}");
         assert_eq!(decoded.encoding.as_deref(), Some("ISO-8859-1"));
-        assert_eq!(decode(b"<p>x", None).encoding, None);
-        assert_eq!(decode(b"<p>\x80", None).text, "<p>\u{80}");
+        assert_eq!(decode(b"<p>x", None, true).encoding, None);
+        assert_eq!(decode(b"<p>\x80", None, true).text, "<p>\u{80}");
     }
 
     #[test]
     fn bad_bytes_in_a_named_encoding_are_an_error() {
-        let decoded = decode(b"<p>caf\xE9", Some("UTF-8"));
+        let decoded = decode(b"<p>caf\xE9", Some("UTF-8"), true);
         assert_eq!(decoded.text, "<p>caf\u{FFFD}");
         assert_eq!(decoded.diagnostics.len(), 1);
-        let unknown = decode(b"<p>caf\xE9", Some("bogus-enc"));
+        let unknown = decode(b"<p>caf\xE9", Some("bogus-enc"), true);
         assert_eq!(unknown.text, "<p>caf\u{E9}");
         assert_eq!(unknown.encoding.as_deref(), Some("ISO-8859-1"));
     }

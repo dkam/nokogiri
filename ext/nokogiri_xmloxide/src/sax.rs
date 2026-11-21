@@ -8,25 +8,22 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 
 use magnus::{
-    Error, Module, Object, RClass, RObject, RString, Ruby, Value, method, prelude::*,
-    typed_data::Obj,
+    Error, Module, Object, RClass, RObject, Ruby, Value, method, prelude::*, typed_data::Obj,
+    value::LazyId,
 };
 use xmloxide::encoding::{declared_encoding, detect_encoding};
 use xmloxide::error::{ErrorSeverity, ParseDiagnostic, ParseError, SourceLocation};
 use xmloxide::events::{Event, EventHandler};
-use xmloxide::html::HtmlParseOptions;
-use xmloxide::parser::ParseOptions;
 
 use crate::classes;
-use crate::document::{libxml2_html_diagnostic, read_all};
-use crate::encoding_handler::Codec;
+use crate::document::parse_options::{NOENT, RECOVER};
+use crate::document::{
+    Input, html_parser_options, libxml2_html_diagnostic, parser_options, read_all,
+};
+use crate::edit::check_string;
+use crate::encoding_handler::{Codec, INVALID_BYTES};
 use crate::html_encoding;
-use crate::html4_tables::{self, DataMode};
-use crate::syntax_error;
-
-/// libxml2's `XML_PARSE_RECOVER` and `XML_PARSE_NOENT` option bits.
-const RECOVER: i64 = 1 << 0;
-const NOENT: i64 = 1 << 1;
+use crate::syntax_error::{self, UNKNOWN_IO_ERROR};
 
 #[derive(Clone, Copy, Default, PartialEq)]
 enum Language {
@@ -36,21 +33,41 @@ enum Language {
 }
 
 impl Language {
-    /// Parses `text` in this language, reporting to `handler`.
+    /// The libxml2 parse options to parse with, given `options`: an HTML
+    /// parser always recovers.
+    fn options(self, options: i64) -> i64 {
+        match self {
+            Language::Xml => options,
+            Language::Html => options | RECOVER,
+        }
+    }
+
+    /// `bytes` as text, and the problem decoding them, if there was one.
+    /// Unless `last`, a character the end of `bytes` cuts off is left out.
+    fn decode<'b>(
+        self,
+        bytes: &'b [u8],
+        encoding: Option<&str>,
+        options: i64,
+        last: bool,
+    ) -> (Cow<'b, str>, Option<InputError>) {
+        match self {
+            Language::Xml => xml_decode(bytes, encoding, options & RECOVER != 0, last),
+            Language::Html => html_decode(bytes, encoding, last),
+        }
+    }
+
+    /// Parses `text` with `options`, reporting to `handler`.
     fn parse(
         self,
         text: &str,
-        recover: bool,
+        options: i64,
         handler: &mut dyn EventHandler,
     ) -> Result<(), ParseError> {
         match self {
-            Language::Xml => xmloxide::events::parse_str(
-                text,
-                &ParseOptions::default().recover(recover),
-                handler,
-            ),
+            Language::Xml => xmloxide::events::parse_str(text, &parser_options(options), handler),
             Language::Html => {
-                xmloxide::events::parse_html(text, &HtmlParseOptions::default(), handler)
+                xmloxide::events::parse_html(text, &html_parser_options(options), handler)
             }
         }
     }
@@ -123,16 +140,14 @@ fn native_memory(
     input: Value,
     encoding: Value,
 ) -> Result<Obj<ParserContext>, Error> {
-    let input = expect_string(ruby, input)?;
-    // Copied out: the context must not hold a borrow of a Ruby string.
-    let bytes = unsafe { input.as_slice() }.to_vec();
-    if bytes.is_empty() {
+    let input = Input::from_string(check_string(ruby, input)?);
+    if input.bytes.is_empty() {
         return Err(Error::new(
             ruby.exception_runtime_error(),
             "input string cannot be empty",
         ));
     }
-    new_context(ruby, class, Some(bytes), encoding)
+    new_context(ruby, class, Some(input.bytes), encoding)
 }
 
 /// `ParserContext.native_io(io, encoding)`
@@ -170,7 +185,7 @@ fn native_file(
 }
 
 /// `HTML4::SAX::ParserContext.native_memory(string, encoding)`: as for XML,
-/// but recovering, as an HTML parser does.
+/// recovering, as an HTML parser does.
 fn html_native_memory(
     ruby: &Ruby,
     class: RClass,
@@ -233,78 +248,50 @@ fn new_context(
     Ok(ruby.obj_wrap_as(context, class))
 }
 
-/// `Check_Type(value, T_STRING)`'s error for anything else.
-fn expect_string(ruby: &Ruby, value: Value) -> Result<RString, Error> {
-    RString::from_value(value).ok_or_else(|| {
-        // nil, true and false by name, as Ruby's rb_builtin_class_name does.
-        let special = [
-            ruby.class_nil_class(),
-            ruby.class_true_class(),
-            ruby.class_false_class(),
-        ];
-        let type_name = if special.iter().any(|&class| value.is_kind_of(class)) {
-            value.inspect()
-        } else {
-            value.class().inspect()
-        };
-        Error::new(
-            ruby.exception_type_error(),
-            format!("wrong argument type {type_name} (expected String)"),
-        )
-    })
-}
-
 /// `ParserContext#parse_with(sax_parser)`: parses the input as XML, calling
 /// the parser's document for each event, and returns nil. An exception
 /// from a callback ends the parse and propagates.
 fn parse_with(ruby: &Ruby, rb_self: Obj<ParserContext>, parser: Value) -> Result<(), Error> {
-    let document = sax_document(ruby, parser)?;
-    let (bytes, io_error) = context_input(ruby, &rb_self)?;
-    let recover = rb_self.recovery.get();
-    let (text, input_error) = decode(&bytes, rb_self.encoding.as_deref(), recover);
-    let mut handler = Callbacks::new(ruby, document, Language::Xml, &rb_self.location);
-    handler.replace_entities = rb_self.replace_entities.get();
-    handler.input_error = input_error.or_else(|| io_error.then(|| unknown_io_error(&text)));
-    // The parser's errors have gone to the document's callbacks.
-    let _ = Language::Xml.parse(&text, recover, &mut handler);
-    handler.raised.map_or(Ok(()), Err)
+    parse_as(ruby, &rb_self, parser, Language::Xml)
 }
 
 /// `HTML4::SAX::ParserContext#parse_with(sax_parser)`: as for XML, parsing
 /// the input as HTML.
 fn html_parse_with(ruby: &Ruby, rb_self: Obj<ParserContext>, parser: Value) -> Result<(), Error> {
-    let document = sax_document(ruby, parser)?;
-    let (bytes, io_error) = context_input(ruby, &rb_self)?;
-    let (text, input_error) = html_decode(&bytes, rb_self.encoding.as_deref());
-    let mut handler = Callbacks::new(ruby, document, Language::Html, &rb_self.location);
-    handler.input_error = input_error.or_else(|| io_error.then(|| unknown_io_error(&text)));
-    let _ = Language::Html.parse(&text, true, &mut handler);
-    handler.raised.map_or(Ok(()), Err)
+    parse_as(ruby, &rb_self, parser, Language::Html)
 }
 
-/// The document of `parser`, which must be a SAX parser.
-fn sax_document(ruby: &Ruby, parser: Value) -> Result<Value, Error> {
+fn parse_as(
+    ruby: &Ruby,
+    context: &Obj<ParserContext>,
+    parser: Value,
+    language: Language,
+) -> Result<(), Error> {
     if !parser.is_kind_of(classes::get(ruby, &classes::XML_SAX_PARSER)) {
         return Err(Error::new(
             ruby.exception_arg_error(),
             "argument must be a Nokogiri::XML::SAX::Parser",
         ));
     }
-    RObject::try_convert(parser)?.ivar_get("@document")
-}
-
-/// The context's input, and whether reading it stopped on an IO error.
-fn context_input<'c>(
-    ruby: &Ruby,
-    context: &'c Obj<ParserContext>,
-) -> Result<(Cow<'c, [u8]>, bool), Error> {
-    Ok(match &context.bytes {
+    let document: Value = RObject::try_convert(parser)?.ivar_get("@document")?;
+    let (bytes, io_error) = match &context.bytes {
         Some(bytes) => (Cow::Borrowed(bytes.as_slice()), false),
         None => {
             let input = read_all(ruby, context.ivar_get("@io")?)?;
             (Cow::Owned(input.bytes), input.io_error)
         }
-    })
+    };
+    let mut options = if context.recovery.get() { RECOVER } else { 0 };
+    if context.replace_entities.get() {
+        options |= NOENT;
+    }
+    let options = language.options(options);
+    let (text, input_error) = language.decode(&bytes, context.encoding.as_deref(), options, true);
+    let mut handler = Callbacks::new(ruby, document, language, options, &context.location);
+    handler.input_error = input_error.or_else(|| io_error.then(|| InputError::io(text.len())));
+    // The parser's errors have gone to the document's callbacks.
+    let _ = language.parse(&text, options, &mut handler);
+    handler.raised.map_or(Ok(()), Err)
 }
 
 /// A problem with the input at a point in it, which libxml2 reports there:
@@ -312,23 +299,24 @@ fn context_input<'c>(
 /// failed read.
 struct InputError {
     at: usize,
-    /// The document's method to call: `error` or `warning`.
-    callback: &'static str,
+    severity: ErrorSeverity,
     message: String,
-    /// Whether the input ends there. Recovering from an invalid byte, the
-    /// parser carries on.
-    halts: bool,
 }
 
-const INVALID_BYTES: &str = "Invalid bytes in character encoding";
+impl InputError {
+    /// A failed read, which ends the input at `at`.
+    fn io(at: usize) -> Self {
+        InputError {
+            at,
+            severity: ErrorSeverity::Fatal,
+            message: UNKNOWN_IO_ERROR.trim_end().to_owned(),
+        }
+    }
 
-/// The error for the end of `text`, where reading the input failed.
-fn unknown_io_error(text: &str) -> InputError {
-    InputError {
-        at: text.len(),
-        callback: "error",
-        message: "Unknown IO error\n".to_owned(),
-        halts: true,
+    /// Whether the input ends there. Recovering from an invalid byte, the
+    /// parser carries on.
+    fn halts(&self) -> bool {
+        self.severity == ErrorSeverity::Fatal
     }
 }
 
@@ -337,7 +325,12 @@ fn unknown_io_error(text: &str) -> InputError {
 /// with it UTF-8 input carries on with U+FFFD. As in libxml2, the encoding
 /// is the one the caller named, else the one a byte order mark or the XML
 /// declaration gives, else UTF-8.
-fn decode(bytes: &[u8], encoding: Option<&str>, recover: bool) -> (String, Option<InputError>) {
+fn xml_decode<'b>(
+    bytes: &'b [u8],
+    encoding: Option<&str>,
+    recover: bool,
+    last: bool,
+) -> (Cow<'b, str>, Option<InputError>) {
     let (detected, bom) = detect_encoding(bytes);
     let declared = || declared_encoding(bytes).and_then(|name| Codec::named(&name));
     let codec = encoding
@@ -349,16 +342,19 @@ fn decode(bytes: &[u8], encoding: Option<&str>, recover: bool) -> (String, Optio
         .bom()
         .and_then(|bom| bytes.strip_prefix(bom))
         .unwrap_or(bytes);
-    let (mut text, invalid_at) = codec.decode(bytes);
+    let (mut text, invalid_at) = codec.decode(bytes, last);
     let error = invalid_at.map(|at| {
         if !recover {
-            text.truncate(at);
+            text.to_mut().truncate(at);
         }
         InputError {
             at,
-            callback: "error",
-            message: format!("{INVALID_BYTES}\n"),
-            halts: !recover,
+            severity: if recover {
+                ErrorSeverity::Error
+            } else {
+                ErrorSeverity::Fatal
+            },
+            message: INVALID_BYTES.to_owned(),
         }
     });
     (text, error)
@@ -366,24 +362,35 @@ fn decode(bytes: &[u8], encoding: Option<&str>, recover: bool) -> (String, Optio
 
 /// HTML input as text, decoded as `HTML4::Document.read_memory` decodes it,
 /// and the problem decoding it, if there was one.
-fn html_decode(bytes: &[u8], encoding: Option<&str>) -> (String, Option<InputError>) {
-    let decoded = html_encoding::decode(bytes, encoding);
+fn html_decode<'b>(
+    bytes: &'b [u8],
+    encoding: Option<&str>,
+    last: bool,
+) -> (Cow<'b, str>, Option<InputError>) {
+    let decoded = html_encoding::decode(bytes, encoding, last);
     let error = decoded.diagnostics.into_iter().next().map(|d| InputError {
         at: d.location.byte_offset,
-        callback: callback(d.severity),
-        message: format!("{}\n", d.message),
-        halts: d.severity == ErrorSeverity::Fatal,
+        severity: d.severity,
+        message: d.message,
     });
     (decoded.text, error)
 }
 
-/// The document's method for a diagnostic of `severity`.
-fn callback(severity: ErrorSeverity) -> &'static str {
-    match severity {
-        ErrorSeverity::Warning => "warning",
-        ErrorSeverity::Error | ErrorSeverity::Fatal => "error",
-    }
-}
+/// The document's SAX methods.
+static XMLDECL: LazyId = LazyId::new("xmldecl");
+static START_DOCUMENT: LazyId = LazyId::new("start_document");
+static END_DOCUMENT: LazyId = LazyId::new("end_document");
+static START_ELEMENT: LazyId = LazyId::new("start_element");
+static END_ELEMENT: LazyId = LazyId::new("end_element");
+static START_ELEMENT_NAMESPACE: LazyId = LazyId::new("start_element_namespace");
+static END_ELEMENT_NAMESPACE: LazyId = LazyId::new("end_element_namespace");
+static CHARACTERS: LazyId = LazyId::new("characters");
+static CDATA_BLOCK: LazyId = LazyId::new("cdata_block");
+static COMMENT: LazyId = LazyId::new("comment");
+static PROCESSING_INSTRUCTION: LazyId = LazyId::new("processing_instruction");
+static REFERENCE: LazyId = LazyId::new("reference");
+static ERROR: LazyId = LazyId::new("error");
+static WARNING: LazyId = LazyId::new("warning");
 
 /// Calls the document's SAX callbacks for each event, as the C extension's
 /// libxml2 handler does.
@@ -393,9 +400,6 @@ struct Callbacks<'a> {
     language: Language,
     replace_entities: bool,
     location: &'a Cell<SourceLocation>,
-    /// The names of the open HTML elements, innermost last: in some, text
-    /// is raw.
-    open: Vec<String>,
     /// A problem with the input, reported when the parser reaches it. If
     /// the input ends there, that error replaces what the parser says about
     /// the premature end, and only the end of the document follows.
@@ -421,55 +425,55 @@ impl<'a> Callbacks<'a> {
         ruby: &'a Ruby,
         document: Value,
         language: Language,
+        options: i64,
         location: &'a Cell<SourceLocation>,
     ) -> Self {
         Callbacks {
             ruby,
             document,
             language,
-            replace_entities: false,
+            replace_entities: options & NOENT != 0,
             location,
-            open: Vec::new(),
             input_error: None,
             reported_input_error: false,
             raised: None,
         }
     }
 
-    /// Keeps track of the open HTML elements, for events reported and for
-    /// those a push parser skips as reported before.
-    fn track(&mut self, event: &Event<'_>) {
-        if self.language == Language::Html {
-            match event {
-                Event::StartElement { name, .. } => self.open.push((*name).to_owned()),
-                Event::EndElement { .. } => drop(self.open.pop()),
-                _ => {}
-            }
-        }
-    }
-
     fn call(&mut self, event: Event<'_>, location: SourceLocation) -> Result<(), Error> {
-        self.track(&event);
-        if let Some(error) = &self.input_error {
-            let reached = match event {
-                Event::EndDocument => true,
-                Event::Diagnostic(d) => d.location.byte_offset >= error.at,
-                _ => !error.halts && location.byte_offset >= error.at,
-            };
-            let halts = error.halts;
-            if reached && !self.reported_input_error {
-                let (callback, message) = (error.callback, error.message.clone());
-                self.reported_input_error = true;
-                self.send(callback, (message,))?;
-            }
-            if halts && self.reported_input_error && !matches!(event, Event::EndDocument) {
-                return Ok(());
-            }
+        if self.report_input_error(&event, location)? {
+            return Ok(());
         }
         match self.language {
             Language::Xml => self.call_xml(event),
             Language::Html => self.call_html(event),
         }
+    }
+
+    /// Reports the problem with the input, if there is one, once the
+    /// parser reaches it, and says whether to drop `event`: one past the
+    /// end of input that the problem cut short. Where the input ends, it is
+    /// what the parser says about the premature end that reaches it.
+    fn report_input_error(
+        &mut self,
+        event: &Event<'_>,
+        location: SourceLocation,
+    ) -> Result<bool, Error> {
+        let Some(error) = &self.input_error else {
+            return Ok(false);
+        };
+        let end = matches!(event, Event::EndDocument);
+        if !self.reported_input_error {
+            let reached = end
+                || location.byte_offset >= error.at
+                    && (!error.halts() || matches!(event, Event::Diagnostic(_)));
+            if !reached {
+                return Ok(false);
+            }
+            self.reported_input_error = true;
+            self.send_diagnostic(error.severity, &error.message)?;
+        }
+        Ok(error.halts() && !end)
     }
 
     fn call_xml(&mut self, event: Event<'_>) -> Result<(), Error> {
@@ -480,7 +484,7 @@ impl<'a> Callbacks<'a> {
                 standalone,
             } => {
                 let standalone = standalone.map(|yes| if yes { "yes" } else { "no" });
-                self.send("xmldecl", (version, encoding, standalone))
+                self.send(&XMLDECL, (version, encoding, standalone))
             }
             Event::StartElement {
                 name,
@@ -509,7 +513,7 @@ impl<'a> Callbacks<'a> {
                     }
                 }
                 self.send(
-                    "start_element_namespace",
+                    &START_ELEMENT_NAMESPACE,
                     (name, rb_attributes, prefix, namespace, namespaces),
                 )
             }
@@ -517,24 +521,20 @@ impl<'a> Callbacks<'a> {
                 name,
                 prefix,
                 namespace,
-            } => self.send("end_element_namespace", (name, prefix, namespace)),
-            Event::Text(text) => self.send("characters", (text,)),
+            } => self.send(&END_ELEMENT_NAMESPACE, (name, prefix, namespace)),
             Event::EntityReference { name, replacement } if !self.replace_entities => {
-                self.send("reference", (name, replacement))
+                self.send(&REFERENCE, (name, replacement))
             }
-            Event::EntityReference { .. } => Ok(()),
-            Event::Diagnostic(diagnostic) => self.send(
-                callback(diagnostic.severity),
-                (format!("{}\n", diagnostic.message),),
-            ),
+            Event::Diagnostic(diagnostic) => {
+                self.send_diagnostic(diagnostic.severity, &diagnostic.message)
+            }
             event => self.call_common(event),
         }
     }
 
     /// The HTML parser's events, as libxml2's HTML parser reports them:
-    /// elements by name, with their attributes as name-value pairs, the
-    /// content of raw text elements (`script`, `style` and the like) as
-    /// CDATA, and its errors as `HTML4::Document` does.
+    /// elements by name, with their attributes as name-value pairs, and its
+    /// errors as `HTML4::Document` does.
     fn call_html(&mut self, event: Event<'_>) -> Result<(), Error> {
         match event {
             Event::StartElement {
@@ -544,45 +544,46 @@ impl<'a> Callbacks<'a> {
                 for attribute in attributes {
                     pairs.push((attribute.name.as_str(), attribute.value.as_str()))?;
                 }
-                self.send("start_element", (name, pairs))
+                self.send(&START_ELEMENT, (name, pairs))
             }
-            Event::EndElement { name, .. } => self.send("end_element", (name,)),
-            Event::Text(text) => {
-                let raw = self
-                    .open
-                    .last()
-                    .and_then(|name| html4_tables::lookup(name))
-                    .is_some_and(|info| {
-                        !matches!(info.data_mode, DataMode::Normal | DataMode::RcData)
-                    });
-                self.send(if raw { "cdata_block" } else { "characters" }, (text,))
-            }
-            Event::Diagnostic(diagnostic) => match libxml2_html_diagnostic(diagnostic.clone()) {
-                Some(d) => self.send(callback(d.severity), (format!("{}\n", d.message),)),
+            Event::EndElement { name, .. } => self.send(&END_ELEMENT, (name,)),
+            Event::Diagnostic(diagnostic) => match libxml2_html_diagnostic(diagnostic) {
+                Some(d) => self.send_diagnostic(d.severity, &d.message),
                 None => Ok(()),
             },
             event => self.call_common(event),
         }
     }
 
-    /// The events reported the same way for XML and HTML.
+    /// The events reported the same way for XML and HTML. Raw text (the
+    /// content of `script` and the like) is CDATA.
     fn call_common(&mut self, event: Event<'_>) -> Result<(), Error> {
         match event {
-            Event::StartDocument => self.send("start_document", ()),
-            Event::EndDocument => self.send("end_document", ()),
-            Event::CData(text) => self.send("cdata_block", (text,)),
-            Event::Comment(text) => self.send("comment", (text,)),
+            Event::StartDocument => self.send(&START_DOCUMENT, ()),
+            Event::EndDocument => self.send(&END_DOCUMENT, ()),
+            Event::Text(text) => self.send(&CHARACTERS, (text,)),
+            Event::CData(text) | Event::RawText(text) => self.send(&CDATA_BLOCK, (text,)),
+            Event::Comment(text) => self.send(&COMMENT, (text,)),
             Event::ProcessingInstruction { target, data } => {
-                self.send("processing_instruction", (target, data))
+                self.send(&PROCESSING_INSTRUCTION, (target, data))
             }
             _ => Ok(()),
         }
     }
 
-    fn send<A: magnus::ArgList>(&self, callback: &str, args: A) -> Result<(), Error> {
-        self.document
-            .funcall::<_, _, Value>(callback, args)
-            .map(drop)
+    /// Calls `error` or `warning` with `message`, ended by a newline as
+    /// libxml2's messages are.
+    fn send_diagnostic(&self, severity: ErrorSeverity, message: &str) -> Result<(), Error> {
+        let method = match severity {
+            ErrorSeverity::Warning => &WARNING,
+            ErrorSeverity::Error | ErrorSeverity::Fatal => &ERROR,
+        };
+        self.send(method, (format!("{message}\n"),))
+    }
+
+    fn send<A: magnus::ArgList>(&self, method: &LazyId, args: A) -> Result<(), Error> {
+        let method = LazyId::get_inner_with(method, self.ruby);
+        self.document.funcall::<_, _, Value>(method, args).map(drop)
     }
 }
 
@@ -593,7 +594,7 @@ fn unreplaced(raw: &str) -> String {
     let mut value = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(at) = rest.find('&') {
-        value.extend(rest[..at].chars().map(normalize_blank));
+        push_literal(&mut value, &rest[..at]);
         rest = &rest[at..];
         let Some(end) = rest.find(';') else {
             break;
@@ -620,16 +621,23 @@ fn unreplaced(raw: &str) -> String {
         }
         rest = &rest[end + 1..];
     }
-    value.extend(rest.chars().map(normalize_blank));
+    push_literal(&mut value, rest);
     value
 }
 
-/// Attribute-value normalization: a literal tab or line end is a space.
-fn normalize_blank(c: char) -> char {
-    if matches!(c, '\t' | '\n' | '\r') {
-        ' '
-    } else {
-        c
+/// Appends `literal` as attribute-value normalization leaves it: a line
+/// end (CRLF included) or tab is a space.
+fn push_literal(value: &mut String, literal: &str) {
+    let mut chars = literal.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            chars.next();
+        }
+        value.push(if matches!(c, '\t' | '\n' | '\r') {
+            ' '
+        } else {
+            c
+        });
     }
 }
 
@@ -647,7 +655,7 @@ struct PushState {
     /// The encoding an HTML push parser was given.
     encoding: Option<String>,
     input: Vec<u8>,
-    /// libxml2 parse options: only RECOVER and NOENT matter.
+    /// libxml2 parse options: RECOVER and NOENT.
     options: i64,
     /// How many events have been reported.
     reported: usize,
@@ -709,9 +717,10 @@ fn push_write(
     last_chunk: Value,
 ) -> Result<Obj<PushParser>, Error> {
     if !chunk.is_nil() {
-        let chunk = expect_string(ruby, chunk)?;
-        let bytes = unsafe { chunk.as_slice() }.to_vec();
-        rb_self.0.borrow_mut().input.extend_from_slice(&bytes);
+        let chunk = check_string(ruby, chunk)?;
+        // Copied in before any further call into Ruby.
+        let bytes = unsafe { chunk.as_slice() };
+        rb_self.0.borrow_mut().input.extend_from_slice(bytes);
     }
     let last = last_chunk.to_bool();
     let parser = RObject::try_convert(rb_self.ivar_get::<_, Value>("@sax_parser")?)?;
@@ -719,42 +728,21 @@ fn push_write(
 
     let state = rb_self.0.borrow();
     let (language, reported) = (state.language, state.reported);
-    let options = match language {
-        Language::Xml => state.options,
-        Language::Html => state.options | RECOVER,
-    };
-    let recover = options & RECOVER != 0;
-    let decode_input = |input: &[u8]| match language {
-        Language::Xml => decode(input, None, recover),
-        Language::Html => html_decode(input, state.encoding.as_deref()),
-    };
-    let (mut text, mut input_error) = decode_input(&state.input);
-    // Before the last chunk, an invalid sequence that leaving out the last
-    // few bytes removes is a character the next chunk may complete.
-    if !last && input_error.is_some() {
-        let input = &state.input;
-        let complete = (1..4.min(input.len()))
-            .map(|k| decode_input(&input[..input.len() - k]))
-            .find(|(_, error)| error.is_none());
-        if let Some(complete) = complete {
-            (text, input_error) = complete;
-        }
-    }
+    let options = language.options(state.options);
+    let (text, input_error) =
+        language.decode(&state.input, state.encoding.as_deref(), options, last);
+    // Owned: the callbacks may write to this parser again.
+    let mut text = text.into_owned();
     let reported_input_error = state.reported_input_error;
     drop(state);
     // Before the last chunk, only up to the last `>`: what follows it is
-    // text or markup that the next chunk may continue. (Where xmloxide
-    // reports running out of input in a construct depends on the construct;
-    // it is the end of the input in one cut at a `>` inside it.)
-    let text = if last {
-        text.as_str()
-    } else {
-        &text[..text.rfind('>').map_or(0, |at| at + 1)]
-    };
-    let invalid_at = input_error.as_ref().map(|error| error.at);
+    // text or markup that the next chunk may continue.
+    if !last {
+        text.truncate(text.rfind('>').map_or(0, |at| at + 1));
+    }
+
     let location = Cell::new(SourceLocation::default());
-    let mut callbacks = Callbacks::new(ruby, document, language, &location);
-    callbacks.replace_entities = options & NOENT != 0;
+    let mut callbacks = Callbacks::new(ruby, document, language, options, &location);
     callbacks.input_error = input_error;
     callbacks.reported_input_error = reported_input_error;
     let mut handler = Push {
@@ -765,21 +753,25 @@ fn push_write(
         complete: 0,
         stopped: false,
     };
-    let result = language.parse(text, recover, &mut handler);
+    let result = language.parse(&text, options, &mut handler);
+    let callbacks = handler.callbacks;
     let mut state = rb_self.0.borrow_mut();
     state.reported = handler.complete.max(reported);
-    state.reported_input_error = handler.callbacks.reported_input_error;
+    state.reported_input_error = callbacks.reported_input_error;
     drop(state);
-    if let Some(raised) = handler.callbacks.raised {
+    if let Some(raised) = callbacks.raised {
         return Err(raised);
     }
     match result {
         // A fatal error at the end of the input so far may be just that.
-        Err(error) if !recover && (last || error.location.byte_offset < text.len()) => {
-            let message = if invalid_at.is_some_and(|at| error.location.byte_offset >= at) {
-                INVALID_BYTES.to_owned()
-            } else {
-                error.message
+        Err(error)
+            if options & RECOVER == 0 && (last || error.location.byte_offset < text.len()) =>
+        {
+            let message = match callbacks.input_error {
+                Some(input) if input.halts() && error.location.byte_offset >= input.at => {
+                    input.message
+                }
+                _ => error.message,
             };
             let diagnostic = ParseDiagnostic {
                 severity: ErrorSeverity::Fatal,
@@ -794,9 +786,10 @@ fn push_write(
 
 /// Passes on the events of a parse of the input so far that weren't
 /// reported before and that the rest of the input can't change: before
-/// the last chunk, nothing from the start of the document, text, or an
-/// error at the end of the input on. In HTML, nor from an element closed
-/// there, which may be closed only because the input ends.
+/// the last chunk, nothing from the end of the input on, where the start
+/// of the document (an XML declaration may yet come), text and errors may
+/// change, and in HTML an element may be closed only because the input
+/// ends.
 struct Push<'a> {
     callbacks: Callbacks<'a>,
     last: bool,
@@ -814,23 +807,20 @@ impl EventHandler for Push<'_> {
         if self.stopped {
             return;
         }
-        let at_end = |offset| !self.last && offset >= self.len;
-        self.stopped = match event {
-            // At the end, an XML declaration may yet come before it.
-            Event::StartDocument | Event::Text(_) => at_end(location.byte_offset),
-            Event::EndElement { .. } if self.callbacks.language == Language::Html => {
-                at_end(location.byte_offset)
+        let at_end = location.byte_offset >= self.len;
+        let incomplete = match event {
+            Event::EndDocument => true,
+            Event::StartDocument | Event::Text(_) | Event::RawText(_) | Event::Diagnostic(_) => {
+                at_end
             }
-            Event::Diagnostic(diagnostic) => at_end(diagnostic.location.byte_offset),
-            Event::EndDocument => !self.last,
+            Event::EndElement { .. } => at_end && self.callbacks.language == Language::Html,
             _ => false,
         };
+        self.stopped = !self.last && incomplete;
         if !self.stopped {
             self.complete += 1;
             if self.complete > self.skip {
                 self.callbacks.event(event, location);
-            } else {
-                self.callbacks.track(&event);
             }
         }
     }

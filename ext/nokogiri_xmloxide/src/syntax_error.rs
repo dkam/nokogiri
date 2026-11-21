@@ -173,6 +173,9 @@ const DOMAIN_IO: i64 = 8;
 const CODE_IO_UNKNOWN: i64 = 1500;
 
 /// The fatal error libxml2 reports when an `xmlReadIO` callback fails.
+/// libxml2's error for input whose reading failed.
+pub const UNKNOWN_IO_ERROR: &str = "Unknown IO error\n";
+
 pub fn io_error(ruby: &Ruby) -> Result<Value, Error> {
     build_fields(
         ruby,
@@ -180,7 +183,7 @@ pub fn io_error(ruby: &Ruby) -> Result<Value, Error> {
             class: classes::get(ruby, &classes::XML_SYNTAX_ERROR),
             domain: DOMAIN_IO,
             code: CODE_IO_UNKNOWN,
-            message: "Unknown IO error\n",
+            message: UNKNOWN_IO_ERROR,
             level: 3,
             line: 0,
             column: 0,
