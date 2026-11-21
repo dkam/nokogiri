@@ -28,6 +28,10 @@ class!(ENTITY_REFERENCE, "Nokogiri::XML::EntityReference");
 class!(DTD, "Nokogiri::XML::DTD");
 class!(XML_DOCUMENT, "Nokogiri::XML::Document");
 class!(HTML4_DOCUMENT, "Nokogiri::HTML4::Document");
+class!(
+    HTML4_ENTITY_DESCRIPTION,
+    "Nokogiri::HTML4::EntityDescription"
+);
 class!(DOCUMENT_FRAGMENT, "Nokogiri::XML::DocumentFragment");
 class!(NODE_SET, "Nokogiri::XML::NodeSet");
 class!(NAMESPACE, "Nokogiri::XML::Namespace");

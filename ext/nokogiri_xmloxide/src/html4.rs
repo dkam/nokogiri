@@ -4,6 +4,7 @@
 
 use magnus::{Error, Module, RArray, RClass, RModule, Ruby, Value, method, prelude::*};
 
+use crate::classes;
 use crate::html4_tables::{ElementInfo, entity_lookup, lookup};
 
 /// An element's description: a pointer into the static table, as in C.
@@ -111,8 +112,7 @@ fn get_entity(ruby: &Ruby, _rb_self: Value, name: String) -> Result<Option<Value
     let Some(&(value, name, description)) = entity_lookup(&name) else {
         return Ok(None);
     };
-    let html4: RModule = ruby.class_object().const_get("Nokogiri")?;
-    let html4: RModule = html4.const_get("HTML4")?;
-    let class: RClass = html4.const_get("EntityDescription")?;
-    class.new_instance((value, name, description)).map(Some)
+    classes::get(ruby, &classes::HTML4_ENTITY_DESCRIPTION)
+        .new_instance((value, name, description))
+        .map(Some)
 }

@@ -8,7 +8,7 @@ use xmloxide::encoding::EncodingError;
 use xmloxide::error::{ErrorSeverity, ParseDiagnostic, ParseError};
 use xmloxide::html::{HtmlParseOptions, parse_html_with_options};
 use xmloxide::parser::{ParseOptions, parse_str_with_options};
-use xmloxide::tree::{Attribute, NodeKind};
+use xmloxide::tree::NodeKind;
 use xmloxide::{Document, NodeId};
 
 use crate::classes;
@@ -177,18 +177,31 @@ fn read_memory(
     encoding: Option<String>,
     options: i64,
 ) -> Result<Value, Error> {
-    // Copy the bytes out first: parsing must not hold a borrow of a Ruby string.
-    let input = Input {
-        bytes: unsafe { input.as_slice() }.to_vec(),
-        io_error: false,
-    };
-    read(ruby, class, &input, url, encoding, options)
+    read(
+        ruby,
+        class,
+        &Input::from_string(input),
+        url,
+        encoding,
+        options,
+    )
 }
 
 /// The bytes to parse, and whether reading them stopped on an IO error.
 struct Input {
     bytes: Vec<u8>,
     io_error: bool,
+}
+
+impl Input {
+    /// The string's bytes, copied out first: parsing must not hold a borrow
+    /// of a Ruby string.
+    fn from_string(string: RString) -> Self {
+        Input {
+            bytes: unsafe { string.as_slice() }.to_vec(),
+            io_error: false,
+        }
+    }
 }
 
 /// libxml2's read size for `xmlReadIO` callbacks (`MINLEN` in xmlIO.c).
@@ -286,12 +299,14 @@ fn html_read_memory(
     encoding: Option<String>,
     options: i64,
 ) -> Result<Value, Error> {
-    // Copied out first, as for XML.
-    let input = Input {
-        bytes: unsafe { input.as_slice() }.to_vec(),
-        io_error: false,
-    };
-    html_read(ruby, class, &input, url, encoding, options)
+    html_read(
+        ruby,
+        class,
+        &Input::from_string(input),
+        url,
+        encoding,
+        options,
+    )
 }
 
 /// `HTML4::Document.read_io(io, url, encoding, options)`
@@ -331,38 +346,30 @@ fn html_read(
         .no_blanks(options & parse_options::NOBLANKS != 0)
         .no_implied(options & parse_options::NOIMPLIED != 0)
         .no_default_doctype(options & parse_options::NODEFDTD != 0);
-    let errors = ruby.ary_new();
-    for diagnostic in &decoded.diagnostics {
-        errors.push(syntax_error::from_diagnostic(ruby, diagnostic)?)?;
-    }
-    let tree = match parse_html_with_options(&decoded.text, &html_options) {
+    let errors = syntax_error::array(ruby, &decoded.diagnostics)?;
+    let mut parsed = parse_html_with_options(&decoded.text, &html_options);
+    match &mut parsed {
         Ok(tree) => {
-            for diagnostic in tree.diagnostics.iter().filter_map(libxml2_html_diagnostic) {
+            let diagnostics = std::mem::take(&mut tree.diagnostics);
+            for diagnostic in diagnostics.into_iter().filter_map(libxml2_html_diagnostic) {
                 errors.push(syntax_error::from_diagnostic(ruby, &diagnostic)?)?;
             }
-            Some(tree)
         }
         Err(failure) => {
-            for error in syntax_error::array_for_failure(ruby, &failure)? {
+            for error in syntax_error::array_for_failure(ruby, failure)? {
                 errors.push(error)?;
             }
-            None
         }
-    };
+    }
     if input.io_error {
         errors.push(syntax_error::io_error(ruby)?)?;
     }
-    let mut tree = match tree {
-        Some(tree) if options & parse_options::RECOVER != 0 || errors.is_empty() => tree,
+    let mut tree = match parsed {
+        Ok(tree) if options & parse_options::RECOVER != 0 || errors.is_empty() => tree,
         _ => return Err(syntax_error::raise_without_recover(ruby, errors)),
     };
     tree.encoding = decoded.encoding;
-    mark_xmlns_attributes(&mut tree);
-    if options & parse_options::NODEFDTD == 0 && doctype(&tree).is_none() {
-        let dtd = default_doctype(&mut tree);
-        let document_node = tree.root();
-        tree.prepend_child(document_node, dtd);
-    }
+    namespace::mark_plain_xmlns_attributes(&mut tree);
     let document = wrap(ruby, class, tree, url, DocKind::Html, &[])?;
     Obj::<NodeObj>::try_convert(document)?.ivar_set("@errors", errors)?;
     Ok(document)
@@ -373,10 +380,11 @@ fn html_read(
 /// xmloxide's parser comes across: an end tag that closes nothing, and one
 /// that closes an element whose own end tag mustn't be left out (`b`, `font`
 /// and the like; table `end_tag` 3), which `htmlAutoCloseOnClose` reports.
-/// A 2.14 mode in `xmloxide::html` would report these itself.
-fn libxml2_html_diagnostic(diagnostic: &ParseDiagnostic) -> Option<ParseDiagnostic> {
+/// So is a misplaced `<head>`. A 2.14 mode in `xmloxide::html` would report
+/// these itself.
+fn libxml2_html_diagnostic(mut diagnostic: ParseDiagnostic) -> Option<ParseDiagnostic> {
     if diagnostic.severity != ErrorSeverity::Warning {
-        return Some(diagnostic.clone());
+        return Some(diagnostic);
     }
     let message = &diagnostic.message;
     let enclosed = |prefix: &str, suffix: &str| message.strip_prefix(prefix)?.strip_suffix(suffix);
@@ -387,49 +395,24 @@ fn libxml2_html_diagnostic(diagnostic: &ParseDiagnostic) -> Option<ParseDiagnost
     } else if let Some((closed, end)) =
         enclosed("implicitly closing <", ">").and_then(|tags| tags.split_once("> before </"))
     {
-        html4_tables::lookup(closed).filter(|info| info.end_tag == 3)?;
+        if html4_tables::lookup(closed)?.end_tag != 3 {
+            return None;
+        }
         format!("Opening and ending tag mismatch: {end} and {closed}")
+    } else if message == "misplaced <head> tag" {
+        format!("htmlParseStartTag: {message}")
     } else {
         return None;
     };
-    Some(ParseDiagnostic {
-        severity: ErrorSeverity::Error,
-        message,
-        location: diagnostic.location,
-    })
+    diagnostic.severity = ErrorSeverity::Error;
+    diagnostic.message = message;
+    Some(diagnostic)
 }
 
-/// libxml2's HTML parser has no namespaces, so an `xmlns` attribute is an
-/// attribute like any other. xmloxide's keeps it as it keeps a namespace
-/// declaration; it becomes the plain `xmlns` attribute this backend tells
-/// from one (`namespace::is_plain_xmlns`). Attributes such as `xmlns:p` are
-/// already ordinary: their names keep the colon, with no prefix.
-fn mark_xmlns_attributes(tree: &mut Document) {
-    let elements: Vec<NodeId> = tree
-        .descendants(tree.root())
-        .filter(|&id| tree.is_element(id))
-        .collect();
-    for id in elements {
-        if let NodeKind::Element { attributes, .. } = tree.kind_mut(id) {
-            let default_declaration =
-                |a: &Attribute| a.name == "xmlns" && a.prefix.is_none() && a.namespace.is_none();
-            for attribute in attributes.iter_mut().filter(|a| default_declaration(a)) {
-                attribute.namespace = Some(namespace::XMLNS_NAMESPACE.to_owned());
-            }
-        }
-    }
-}
-
-/// The DOCTYPE `htmlNewDoc` and `htmlParseDocument` give an HTML document
-/// that has none: HTML 4.0 Transitional's.
-fn default_doctype(tree: &mut Document) -> NodeId {
-    tree.create_node(NodeKind::DocumentType {
-        name: "html".to_owned(),
-        public_id: Some("-//W3C//DTD HTML 4.0 Transitional//EN".to_owned()),
-        system_id: Some("http://www.w3.org/TR/REC-html40/loose.dtd".to_owned()),
-        internal_subset: None,
-    })
-}
+/// HTML 4.0 Transitional's DOCTYPE identifiers, which `htmlNewDoc` gives a
+/// document when given none.
+const HTML4_PUBLIC_ID: &str = "-//W3C//DTD HTML 4.0 Transitional//EN";
+const HTML4_SYSTEM_ID: &str = "http://www.w3.org/TR/REC-html40/loose.dtd";
 
 /// `HTML4::Document.new(uri = nil, external_id = nil, *rest)`, as
 /// `htmlNewDoc` makes it: an empty HTML document whose internal subset is
@@ -444,8 +427,8 @@ fn html_new(ruby: &Ruby, class: RClass, args: &[Value]) -> Result<Value, Error> 
     };
     let (system_id, public_id) = match (string_at(0)?, string_at(1)?) {
         (None, None) => (
-            Some("http://www.w3.org/TR/REC-html40/loose.dtd".to_owned()),
-            Some("-//W3C//DTD HTML 4.0 Transitional//EN".to_owned()),
+            Some(HTML4_SYSTEM_ID.to_owned()),
+            Some(HTML4_PUBLIC_ID.to_owned()),
         ),
         ids => ids,
     };

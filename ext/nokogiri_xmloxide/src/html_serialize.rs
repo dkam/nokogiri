@@ -3,12 +3,14 @@
 //! (xmlsave.c), `htmlNodeDumpFormatOutput` and `htmlSetMetaEncoding`
 //! (HTMLtree.c), and the escaping and output encoding they use.
 
+use std::fmt::Write as _;
+
 use xmloxide::tree::{Attribute, NodeKind};
 use xmloxide::{Document, NodeId};
 
 use crate::document::doctype;
-use crate::html_encoding::Codec;
-use crate::html4_tables::{self, ElementInfo};
+use crate::encoding_handler::Codec;
+use crate::html4_tables;
 use crate::namespace;
 
 /// Serializes `id` as `htmlNodeDumpOutputInternal` does, into bytes in the
@@ -24,24 +26,30 @@ pub fn serialize(
     encoding: Option<&str>,
     format: bool,
 ) -> Vec<u8> {
-    // libxml2 can't open a save context in an encoding it doesn't know, so
-    // writes nothing and leaves the document as it is.
-    if encoding
-        .is_some_and(|name| !name.eq_ignore_ascii_case("html") && Codec::named(name).is_none())
-    {
-        return Vec::new();
-    }
-    let named = encoding
-        .map(str::to_owned)
-        .or_else(|| tree.encoding.clone());
-    if let Some(name) = &named {
-        set_meta_encoding(tree, name);
-    }
-    let output_encoding = encoding
-        .map(str::to_owned)
-        .or(named)
-        .or_else(|| meta_encoding(tree))
-        .unwrap_or_else(|| "HTML".to_owned());
+    // libxml2 can't write in an encoding it doesn't know: for the caller's,
+    // it can't open a save context, so leaves the document as it is.
+    let output = match encoding {
+        Some(name) => {
+            let Some(output) = Output::named(name) else {
+                return Vec::new();
+            };
+            set_meta_encoding(tree, name);
+            output
+        }
+        None => {
+            let name = match tree.encoding.clone() {
+                Some(name) => {
+                    set_meta_encoding(tree, &name);
+                    Some(name)
+                }
+                None => meta_encoding(tree),
+            };
+            match name.as_deref().map_or(Some(Output::Html), Output::named) {
+                Some(output) => output,
+                None => return Vec::new(),
+            }
+        }
+    };
     let writer = Writer {
         tree,
         html_document,
@@ -51,17 +59,9 @@ pub fn serialize(
     let mut out = String::new();
     match target {
         Target::Node(id) => writer.node(*id, &mut out),
-        Target::Attribute { owner, attribute } => {
-            let (element, in_no_namespace) = match &tree.node(*owner).kind {
-                NodeKind::Element {
-                    name, namespace, ..
-                } => (name.as_str(), namespace.is_none()),
-                _ => ("", true),
-            };
-            writer.attribute(attribute, element, in_no_namespace, &mut out);
-        }
+        Target::Attribute { owner, attribute } => writer.attribute(attribute, *owner, &mut out),
     }
-    encode(&out, &output_encoding)
+    output.encode(out)
 }
 
 /// What to serialize: a node, or an attribute (a copy of it, since the
@@ -178,58 +178,49 @@ impl Writer<'_> {
             .iter()
             .filter(|a| namespace::declaration(a).is_none())
         {
-            self.attribute(attribute, name, element_namespace.is_none(), out);
+            self.attribute(attribute, id, out);
         }
 
-        let block = |info: Option<&ElementInfo>| info.is_some_and(|info| info.inline == 0);
+        // With FORMAT, a block element gets line breaks around it, and
+        // inside it if it has several children, unless its name starts with
+        // "p" (p, pre, param).
+        let block = self.format && info.is_some_and(|info| info.inline == 0);
         let void = info.is_some_and(|info| info.empty != 0);
-        let Some(first) = tree.first_child(id).filter(|_| !void) else {
-            // A void element ends at its start tag, leaving out any children,
-            // as does an empty one whose end tag may be left out (except html
-            // and body).
-            if void
+        match tree.first_child(id) {
+            Some(first) if !void => {
+                out.push('>');
+                let last = tree.last_child(id).unwrap_or(first);
+                let break_inside = block && first != last && !name.starts_with('p');
+                if break_inside && !is_text_like(tree, first) {
+                    out.push('\n');
+                }
+                for child in tree.children(id) {
+                    self.node(child, out);
+                }
+                if break_inside && !is_text_like(tree, last) {
+                    out.push('\n');
+                }
+                out.push_str("</");
+                qname(out);
+                out.push('>');
+            }
+            // A void element ends at its start tag, leaving out any
+            // children, as does an empty one whose end tag may be left out
+            // (except html and body).
+            _ if void
                 || info.is_some_and(|info| {
                     info.save_end_tag != 0 && info.name != "html" && info.name != "body"
-                })
+                }) =>
             {
                 out.push('>');
-            } else {
+            }
+            _ => {
                 out.push_str("></");
                 qname(out);
                 out.push('>');
             }
-            if self.format && block(info) {
-                self.break_before_next(id, out);
-            }
-            return;
-        };
-
-        out.push('>');
-        let last = tree.last_child(id).unwrap_or(first);
-        let several = first != last;
-        if self.format
-            && block(info)
-            && !is_text_like(tree, first)
-            && several
-            && !name.starts_with('p')
-        {
-            out.push('\n');
         }
-        for child in tree.children(id) {
-            self.node(child, out);
-        }
-        if self.format
-            && block(info)
-            && !is_text_like(tree, last)
-            && several
-            && !name.starts_with('p')
-        {
-            out.push('\n');
-        }
-        out.push_str("</");
-        qname(out);
-        out.push('>');
-        if self.format && block(info) {
+        if block {
             self.break_before_next(id, out);
         }
     }
@@ -250,14 +241,8 @@ impl Writer<'_> {
         }
     }
 
-    /// `htmlAttrDumpOutput`.
-    fn attribute(
-        &self,
-        attribute: &Attribute,
-        element: &str,
-        element_in_no_namespace: bool,
-        out: &mut String,
-    ) {
+    /// `htmlAttrDumpOutput`, for an attribute of `owner`.
+    fn attribute(&self, attribute: &Attribute, owner: NodeId, out: &mut String) {
         out.push(' ');
         let in_no_namespace = namespace::attribute_namespace(attribute).is_none();
         if let (Some(prefix), false) = (&attribute.prefix, in_no_namespace) {
@@ -272,12 +257,13 @@ impl Writer<'_> {
         self.escape(&attribute.value, &mut value);
         out.push('=');
         let is_uri = in_no_namespace
-            && element_in_no_namespace
+            && self.tree.node_namespace(owner).is_none()
             && (["href", "action", "src"]
                 .iter()
                 .any(|uri| attribute.name.eq_ignore_ascii_case(uri))
                 || (attribute.name.eq_ignore_ascii_case("name")
-                    && element.eq_ignore_ascii_case("a")));
+                    && element_name(self.tree, owner)
+                        .is_some_and(|e| e.eq_ignore_ascii_case("a"))));
         if is_uri {
             let trimmed = value.trim_start_matches([' ', '\t', '\n', '\r']);
             write_quoted(&uri_escape(trimmed), out);
@@ -428,10 +414,11 @@ fn escape_namespace(href: &str, out: &mut String) {
 // --- The <meta> charset ----------------------------------------------------
 
 /// The `http-equiv="Content-Type"` meta element `htmlGetMetaEncoding` and
-/// `htmlSetMetaEncoding` look at, and the head they look in: the first such
-/// meta among the document's top-level elements, the html element's, or the
-/// head's, depending on which of those comes first.
-fn find_meta(tree: &Document, case_insensitive: bool) -> (Option<NodeId>, Option<NodeId>) {
+/// `htmlSetMetaEncoding` look at, with its content, and the element a new
+/// one would go in. They take the first html, head or meta element at the
+/// top level, and in an html element the first head or meta; then search a
+/// head's children, or a meta and its next siblings.
+fn find_meta(tree: &Document, case_insensitive: bool) -> (Option<NodeId>, Option<(NodeId, &str)>) {
     let is = |id: NodeId, wanted: &str| {
         element_name(tree, id).is_some_and(|name| {
             if case_insensitive {
@@ -441,61 +428,45 @@ fn find_meta(tree: &Document, case_insensitive: bool) -> (Option<NodeId>, Option
             }
         })
     };
-    let elements = |parent: NodeId| {
+    let first = |parent: NodeId, names: &[&str]| {
         tree.children(parent)
-            .filter(|&child| element_name(tree, child).is_some())
-            .collect::<Vec<_>>()
+            .find(|&id| names.iter().any(|name| is(id, name)))
     };
-    let content_meta = |siblings: &[NodeId]| {
-        siblings
-            .iter()
-            .copied()
-            .find(|&id| is(id, "meta") && content_type(tree, id).is_some())
-    };
-
-    let top = elements(tree.root());
-    let (head, siblings) = 'found: {
-        for (i, &id) in top.iter().enumerate() {
-            if is(id, "html") {
-                let inner = elements(id);
-                for (j, &id) in inner.iter().enumerate() {
-                    if is(id, "head") {
-                        break 'found (Some(id), elements(id));
-                    }
-                    if is(id, "meta") {
-                        break 'found (tree.parent(id), inner[j..].to_vec());
-                    }
-                }
-                return (None, None);
-            }
-            if is(id, "head") {
-                break 'found (Some(id), elements(id));
-            }
-            if is(id, "meta") {
-                break 'found (None, top[i..].to_vec());
-            }
+    let mut head = None;
+    let mut found = first(tree.root(), &["html", "head", "meta"]);
+    if let Some(html) = found.filter(|&id| is(id, "html")) {
+        found = first(html, &["head", "meta"]);
+        // A meta among the html element's children goes before them.
+        if found.is_some_and(|id| is(id, "meta")) {
+            head = Some(html);
         }
-        return (None, None);
+    }
+    let start = match found {
+        Some(id) if is(id, "head") => {
+            head = Some(id);
+            tree.first_child(id)
+        }
+        start => start,
     };
-    (head, content_meta(&siblings))
+    let meta = std::iter::successors(start, |&id| tree.next_sibling(id))
+        .filter(|&id| is(id, "meta"))
+        .find_map(|id| Some((id, content_type(tree, id)?)));
+    (head, meta)
 }
 
 /// A meta element's `content` attribute, if it has `http-equiv` of
 /// Content-Type.
-fn content_type(tree: &Document, meta: NodeId) -> Option<String> {
-    let NodeKind::Element { attributes, .. } = &tree.node(meta).kind else {
-        return None;
-    };
+fn content_type(tree: &Document, meta: NodeId) -> Option<&str> {
     let mut http = false;
     let mut content = None;
     // As libxml2, an attribute with no value (no text child) is skipped.
-    for attribute in attributes.iter().filter(|a| !a.value.is_empty()) {
+    for attribute in tree.attributes(meta).iter().filter(|a| !a.value.is_empty()) {
         if attribute.name.eq_ignore_ascii_case("http-equiv")
             && attribute.value.eq_ignore_ascii_case("Content-Type")
         {
             http = true;
         } else if attribute.name.eq_ignore_ascii_case("content") {
-            content = Some(attribute.value.clone());
+            content = Some(attribute.value.as_str());
         }
         if http && content.is_some() {
             return content;
@@ -507,15 +478,17 @@ fn content_type(tree: &Document, meta: NodeId) -> Option<String> {
 /// `htmlGetMetaEncoding`: the charset in the document's Content-Type meta.
 fn meta_encoding(tree: &Document) -> Option<String> {
     let (_, meta) = find_meta(tree, false);
-    let content = content_type(tree, meta?)?;
-    let after = ["charset=", "Charset=", "CHARSET="]
-        .iter()
-        .find_map(|key| content.find(key).map(|at| at + key.len()))
-        .or_else(|| {
-            ["charset =", "Charset =", "CHARSET ="]
-                .iter()
-                .find_map(|key| content.find(key).map(|at| at + key.len()))
-        })?;
+    let (_, content) = meta?;
+    let after = [
+        "charset=",
+        "Charset=",
+        "CHARSET=",
+        "charset =",
+        "Charset =",
+        "CHARSET =",
+    ]
+    .iter()
+    .find_map(|key| content.find(key).map(|at| at + key.len()))?;
     Some(content[after..].trim_start_matches([' ', '\t']).to_owned())
 }
 
@@ -527,57 +500,75 @@ fn set_meta_encoding(tree: &mut Document, encoding: &str) {
     if encoding.eq_ignore_ascii_case("html") {
         return;
     }
-    let content = format!("text/html; charset={encoding}");
-    match find_meta(tree, true) {
-        (_, Some(meta)) => {
-            let current = content_type(tree, meta).unwrap_or_default();
-            if !current
-                .to_ascii_lowercase()
-                .contains(&encoding.to_ascii_lowercase())
-            {
-                tree.set_attribute(meta, "content", &content);
-            }
+    let (head, meta) = find_meta(tree, true);
+    let meta = meta.map(|(id, current)| (id, contains_ignore_ascii_case(current, encoding)));
+    let content = || format!("text/html; charset={encoding}");
+    match (head, meta) {
+        (_, Some((_, true))) | (None, None) => {}
+        (_, Some((meta, false))) => {
+            tree.set_attribute(meta, "content", &content());
         }
         (Some(head), None) => {
             let meta = tree.create_element("meta");
             tree.set_attribute(meta, "http-equiv", "Content-Type");
-            tree.set_attribute(meta, "content", &content);
+            tree.set_attribute(meta, "content", &content());
             match tree.first_child(head) {
                 Some(first) => tree.insert_before(first, meta),
                 None => tree.append_child(head, meta),
             }
         }
-        (None, None) => {}
     }
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    needle.is_empty()
+        || haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 // --- Output encoding --------------------------------------------------------
 
-/// The serialized text in `encoding`. libxml2's "HTML" encoding writes each
-/// character beyond ASCII as its HTML 4 entity, or a decimal character
-/// reference; other encodings write a character they can't represent as a
-/// decimal character reference.
-fn encode(text: &str, encoding: &str) -> Vec<u8> {
-    if encoding.eq_ignore_ascii_case("html") {
-        let mut out = String::with_capacity(text.len());
-        for c in text.chars() {
-            if c.is_ascii() {
-                out.push(c);
-            } else {
-                match html4_tables::entity_for(u32::from(c)) {
-                    Some(name) => {
-                        out.push('&');
-                        out.push_str(name);
-                        out.push(';');
-                    }
-                    None => out.push_str(&format!("&#{};", u32::from(c))),
+/// The encoding output is written in: libxml2's "HTML", which writes each
+/// character beyond ASCII as its HTML 4 entity or a decimal character
+/// reference, or a real one.
+#[derive(Clone, Copy)]
+enum Output {
+    Html,
+    Codec(Codec),
+}
+
+impl Output {
+    fn named(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("html") {
+            Some(Output::Html)
+        } else {
+            Codec::named(name).map(Output::Codec)
+        }
+    }
+
+    fn encode(self, text: String) -> Vec<u8> {
+        let Output::Codec(codec) = self else {
+            if text.is_ascii() {
+                return text.into_bytes();
+            }
+            let mut out = String::with_capacity(text.len() + text.len() / 4);
+            for c in text.chars() {
+                if c.is_ascii() {
+                    out.push(c);
+                } else if let Some(name) = html4_tables::entity_for(u32::from(c)) {
+                    out.push('&');
+                    out.push_str(name);
+                    out.push(';');
+                } else {
+                    let _ = write!(out, "&#{};", u32::from(c));
                 }
             }
-        }
-        return out.into_bytes();
+            return out.into_bytes();
+        };
+        codec.encode(text)
     }
-    // libxml2 writes nothing in an encoding it doesn't know.
-    Codec::named(encoding).map_or_else(Vec::new, |codec| codec.encode(text))
 }
 
 #[cfg(test)]
@@ -607,11 +598,13 @@ mod tests {
     #[test]
     fn the_html_encoding_writes_entities() {
         assert_eq!(
-            encode("caf\u{e9} \u{2713} \u{20ac}", "HTML"),
+            Output::Html.encode("caf\u{e9} \u{2713} \u{20ac}".to_owned()),
             b"caf&eacute; &#10003; &euro;"
         );
         assert_eq!(
-            encode("caf\u{e9} \u{2713}", "ISO-8859-1"),
+            Output::named("ISO-8859-1")
+                .unwrap()
+                .encode("caf\u{e9} \u{2713}".to_owned()),
             b"caf\xE9 &#10003;"
         );
     }

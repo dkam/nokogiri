@@ -69,6 +69,35 @@ pub fn is_plain_xmlns(attr: &Attribute) -> bool {
         && attr.namespace.as_deref() == Some(XMLNS_NAMESPACE)
 }
 
+/// An `xmlns` attribute as a parser leaves it: no prefix, no namespace.
+fn is_unmarked_xmlns(attr: &Attribute) -> bool {
+    attr.prefix.is_none() && attr.namespace.is_none() && attr.name == "xmlns"
+}
+
+/// Makes a parsed `xmlns` attribute the plain `xmlns` attribute that
+/// `is_plain_xmlns` tells from a declaration: an HTML element's, which is an
+/// attribute like any other. (`xmlns:p` already is: its name keeps the
+/// colon, with no prefix.)
+pub fn mark_plain_xmlns(attr: &mut Attribute) {
+    if is_unmarked_xmlns(attr) {
+        attr.namespace = Some(XMLNS_NAMESPACE.to_owned());
+    }
+}
+
+/// `mark_plain_xmlns` for every attribute of `tree`, as libxml2's HTML4
+/// parser, which has no namespaces, would have them.
+pub fn mark_plain_xmlns_attributes(tree: &mut Document) {
+    let elements: Vec<NodeId> = tree
+        .descendants(tree.root())
+        .filter(|&id| tree.attributes(id).iter().any(is_unmarked_xmlns))
+        .collect();
+    for id in elements {
+        if let NodeKind::Element { attributes, .. } = tree.kind_mut(id) {
+            attributes.iter_mut().for_each(mark_plain_xmlns);
+        }
+    }
+}
+
 /// The namespace an attribute is in: none for a plain `xmlns` attribute.
 pub fn attribute_namespace(attr: &Attribute) -> Option<&str> {
     if is_plain_xmlns(attr) {

@@ -222,41 +222,34 @@ pub fn array_for_failure(ruby: &Ruby, failure: &ParseError) -> Result<RArray, Er
 /// `SyntaxError.aggregate(errors)`, or a RuntimeError if there are none.
 pub fn raise_aggregate(ruby: &Ruby, errors: RArray) -> Error {
     let class = classes::get(ruby, &classes::XML_SYNTAX_ERROR);
-    match class.funcall::<_, _, Value>("aggregate", (errors,)) {
-        Ok(exception) if exception.is_nil() => {
-            Error::new(ruby.exception_runtime_error(), "Could not parse document")
-        }
-        Ok(exception) => match Exception::from_value(exception) {
-            Some(exception) => exception.into(),
-            None => Error::new(ruby.exception_runtime_error(), "Could not parse document"),
-        },
-        Err(error) => error,
-    }
+    exception_or_runtime_error(ruby, class.funcall("aggregate", (errors,)))
 }
 
 /// Raises what `htmlReadMemory`'s binding raises when a parse without
 /// RECOVER reports anything: a SyntaxError carrying the first error, or a
 /// RuntimeError if the parse failed with none.
 pub fn raise_without_recover(ruby: &Ruby, errors: RArray) -> Error {
-    let Ok(first) = errors.entry::<Value>(0) else {
-        return Error::new(ruby.exception_runtime_error(), "Could not parse document");
-    };
-    if first.is_nil() {
-        return Error::new(ruby.exception_runtime_error(), "Could not parse document");
-    }
-    let message = match first.funcall::<_, _, String>("to_s", ()) {
-        Ok(message) => message,
-        Err(error) => return error,
-    };
-    let class = classes::get(ruby, &classes::XML_SYNTAX_ERROR);
-    match class.new_instance((format!(
-        "Parser without recover option encountered error or warning: {message}"
-    ),))
-    {
-        Ok(exception) => match Exception::from_value(exception) {
-            Some(exception) => exception.into(),
-            None => Error::new(ruby.exception_runtime_error(), message),
-        },
+    let exception = errors.entry::<Option<Value>>(0).and_then(|first| {
+        let Some(first) = first else {
+            return Ok(ruby.qnil().as_value());
+        };
+        let message: String = first.funcall("to_s", ())?;
+        classes::get(ruby, &classes::XML_SYNTAX_ERROR).new_instance((format!(
+            "Parser without recover option encountered error or warning: {message}"
+        ),))
+    });
+    exception_or_runtime_error(ruby, exception)
+}
+
+/// `exception` as an error to raise; if it is nil, a RuntimeError "Could
+/// not parse document", as the C extension raises when it has nothing
+/// better.
+fn exception_or_runtime_error(ruby: &Ruby, exception: Result<Value, Error>) -> Error {
+    match exception {
+        Ok(exception) => Exception::from_value(exception).map_or_else(
+            || Error::new(ruby.exception_runtime_error(), "Could not parse document"),
+            Error::from,
+        ),
         Err(error) => error,
     }
 }

@@ -57,11 +57,13 @@ pub fn entity_lookup(name: &str) -> Option<&'static (u32, &'static str, &'static
 }
 
 /// libxml2's `htmlEntityValueLookup`: the name of the entity for the code
-/// point `value`, the first in the table if there are several.
+/// point `value`, the first in the table if there are several. The table is
+/// in order of value.
 pub fn entity_for(value: u32) -> Option<&'static str> {
+    let at = ENTITIES.partition_point(|entity| entity.0 < value);
     ENTITIES
-        .iter()
-        .find(|entity| entity.0 == value)
+        .get(at)
+        .filter(|entity| entity.0 == value)
         .map(|entity| entity.1)
 }
 

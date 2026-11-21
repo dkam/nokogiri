@@ -170,10 +170,7 @@ fn reshape_element(tree: &mut Document, root: NodeId, id: NodeId) {
                 Some(_) => {}
                 // An HTML element's `xmlns` attribute is an attribute, not a
                 // declaration.
-                None if attribute.prefix.is_none() && attribute.name == "xmlns" => {
-                    attribute.namespace = Some(XMLNS.to_owned());
-                }
-                None => {}
+                None => namespace::mark_plain_xmlns(attribute),
             }
         }
     }
